@@ -1,0 +1,17 @@
+# Виртуальное окружение
+venv/
+env/
+
+# Секретные данные
+.env
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Результаты
+*.json
+*.csv
