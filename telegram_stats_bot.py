@@ -11,30 +11,17 @@ load_dotenv()
 API_ID = int(os.getenv('API_ID'))
 API_HASH = os.getenv('API_HASH')
 PHONE = os.getenv('PHONE')
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', 'output')
+
 
 
 def parse_channel_input(raw: str) -> str:
-    """
-    Принимает любой из форматов:
-      - @channelname
-      - channelname
-      - https://t.me/channelname
-      - https://t.me/+InviteHash  (приватный канал)
-      - https://t.me/joinchat/InviteHash  (приватный канал, старый формат)
-    Возвращает строку, готовую для передачи в client.get_entity().
-    """
     raw = raw.strip()
-
-    # Ссылки на приватные каналы — передаём как есть, Telethon умеет их резолвить
     if re.match(r'https?://t\.me/(joinchat/|\+)', raw):
         return raw
-
-    # Обычная t.me ссылка — вытаскиваем юзернейм
     m = re.match(r'https?://t\.me/([\w]+)', raw)
     if m:
         return m.group(1)
-
-    # @username или просто username
     return raw.lstrip('@')
 
 
@@ -49,44 +36,82 @@ def ask_channel() -> str:
         print("⚠️  Поле не может быть пустым, попробуйте снова.")
 
 
-def ask_date(prompt: str, end_of_day: bool = False) -> datetime:
+def ask_start_date() -> datetime:
     while True:
-        raw = input(prompt).strip()
+        raw = input("Дата начала: ").strip()
         try:
             dt = datetime.strptime(raw, '%Y-%m-%d')
-            if end_of_day:
-                dt = dt.replace(hour=23, minute=59, second=59)
             return dt.replace(tzinfo=timezone.utc)
         except ValueError:
             print("⚠️  Неверный формат. Используйте ГГГГ-ММ-ДД (например 2025-01-01).")
 
 
-def ask_dates() -> tuple[datetime, datetime]:
+def ask_end_date() -> datetime:
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    while True:
+        raw = input(f"Дата конца   [Enter = сегодня {today}]: ").strip()
+        if not raw:
+            return datetime.now(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=0)
+        try:
+            dt = datetime.strptime(raw, '%Y-%m-%d')
+            return dt.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        except ValueError:
+            print("⚠️  Неверный формат. Используйте ГГГГ-ММ-ДД (например 2025-03-06).")
+
+
+def ask_dates() -> tuple:
     print("\n📅 Укажите диапазон дат (формат: ГГГГ-ММ-ДД)\n")
     while True:
-        start = ask_date("Дата начала: ")
-        end = ask_date("Дата конца:  ", end_of_day=True)
+        start = ask_start_date()
+        end = ask_end_date()
         if end >= start:
             return start, end
         print("⚠️  Дата конца должна быть не раньше даты начала.\n")
 
 
-async def get_channel_stats(client, channel: str, start_date: datetime, end_date: datetime) -> list:
-    posts_data = []
+def ask_sort() -> tuple:
+    print("\n📋 Сортировка постов:")
+    print("   1 — по дате (по умолчанию, Enter)")
+    print("   2 — по пересылкам (макс → мин)")
+    print("   3 — по реакциям  (макс → мин)\n")
+    options = {
+        '':  ('date',      'по дате'),
+        '1': ('date',      'по дате'),
+        '2': ('forwards',  'по пересылкам'),
+        '3': ('reactions', 'по реакциям'),
+    }
+    while True:
+        raw = input("Выбор [1/2/3]: ").strip()
+        if raw in options:
+            return options[raw]
+        print("⚠️  Введите 1, 2, 3 или нажмите Enter.")
 
-    entity = await client.get_entity(channel)
+
+async def resolve_channel(client, channel: str):
+    try:
+        return await client.get_entity(channel)
+    except Exception as e:
+        print(f"\n❌ Канал не найден: {e}")
+        return None
+
+
+async def get_channel_stats(client, channel: str, start_date: datetime, end_date: datetime):
+    entity = await resolve_channel(client, channel)
+    if entity is None:
+        return None
+
     print(f"\n✅ Канал найден: {entity.title}")
     print(f"   ID: {entity.id}")
     print(f"   Период: {start_date.date()} — {end_date.date()}")
     print(f"\n📊 Начинаем сбор статистики...\n")
 
+    posts_data = []
+
     async for message in client.iter_messages(entity):
         if message.date < start_date:
             break
-
         if message.date > end_date:
             continue
-
         if not message.text and not message.message:
             continue
 
@@ -116,19 +141,26 @@ async def get_channel_stats(client, channel: str, start_date: datetime, end_date
 
 
 async def main():
-    # --- Интерактивный ввод ---
     channel = ask_channel()
     start_date, end_date = ask_dates()
+    sort_key, sort_label = ask_sort()
 
-    # --- Подключение ---
     client = TelegramClient('session_name', API_ID, API_HASH)
     await client.start(phone=PHONE)
     print("\n🔑 Авторизация успешна!")
 
     try:
-        stats = await get_channel_stats(client, channel, start_date, end_date)
+        while True:
+            stats = await get_channel_stats(client, channel, start_date, end_date)
+            if stats is not None:
+                break
+            print("   Попробуйте ввести канал ещё раз.")
+            channel = ask_channel()
 
-        stats_sorted = sorted(stats, key=lambda x: x['forwards'], reverse=True)
+        if sort_key == 'date':
+            stats_sorted = sorted(stats, key=lambda x: x['date'])
+        else:
+            stats_sorted = sorted(stats, key=lambda x: x[sort_key], reverse=True)
 
         result = {
             'channel': channel,
@@ -136,6 +168,7 @@ async def main():
                 'start': start_date.strftime('%Y-%m-%d'),
                 'end': end_date.strftime('%Y-%m-%d'),
             },
+            'sort': sort_label,
             'total_posts': len(stats_sorted),
             'total_views': sum(p['views'] for p in stats_sorted),
             'total_forwards': sum(p['forwards'] for p in stats_sorted),
@@ -143,7 +176,9 @@ async def main():
             'posts': stats_sorted,
         }
 
-        filename = (
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        filename = os.path.join(
+            OUTPUT_DIR,
             f'telegram_stats_{channel}_'
             f'{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.json'
         )
@@ -152,15 +187,17 @@ async def main():
             json.dump(result, f, ensure_ascii=False, indent=2)
 
         print(f"\n✅ Статистика сохранена: {filename}")
+        print(f"🔃 Сортировка:       {sort_label}")
         print(f"📊 Всего постов:     {result['total_posts']}")
         print(f"👁  Всего просмотров: {result['total_views']}")
         print(f"↪️  Всего пересылок: {result['total_forwards']}")
         print(f"❤️  Всего реакций:   {result['total_reactions']}")
 
         if stats_sorted:
-            print("\n🔥 ТОП-5 постов по пересылкам:")
+            top_label = "последних" if sort_key == "date" else "топ"
+            print(f"\n🔥 5 {top_label} постов ({sort_label}):")
             for i, post in enumerate(stats_sorted[:5], 1):
-                print(f"  {i}. Пересылок: {post['forwards']}, Просмотров: {post['views']}")
+                print(f"  {i}. Пересылок: {post['forwards']}, Реакций: {post['reactions']}, Просмотров: {post['views']}")
                 print(f"     Текст: {post['text'][:60]}...")
                 print(f"     Дата:  {post['date']}\n")
         else:
