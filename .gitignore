@@ -1,23 +1,20 @@
-# Виртуальное окружение
-venv/
-env/
-output/
+# Ignore everything by default; keep only the exporter project surface.
+*
 
-# Секретные данные
-.env
-*.session
-*.session-journal
+!.gitignore
+!AGENTS.md
+!README.md
+!requirements.txt
+!telegram_stats_bot.py
+!test_telegram_stats_bot.py
+!export_marketing_chat.py
+!sort_posts.py
+!sort_posts_readme.txt
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Результаты
-*.json
-*.csv
-Посты о баре из тг Сергея.txt
-analyze.md
-gemini_token_count.py
-.DS_Store
-.worktrees/
+!docs/
+docs/*
+!docs/plans/
+docs/plans/*
+!docs/plans/2026-08-21-1435-feat-telegram-export-expansion-plan.md
+!docs/plans/2026-10-12-1239-feat-export-media-html-context-plan.md
+!docs/output-contract.md
