@@ -4,6 +4,7 @@
 !.gitignore
 !AGENTS.md
 !README.md
+!.env.example
 !requirements.txt
 !telegram_stats_bot.py
 !test_telegram_stats_bot.py

@@ -1,4 +1,4 @@
-# Telegram channel exporter
+# tgdl — Telegram channel exporter
 
 `telegram_stats_bot.py` is an interactive Telethon CLI that exports one or more
 Telegram channels into compact, analysis-ready files. It can include channel
@@ -6,30 +6,34 @@ metadata, posts, comments, and downloadable media.
 
 ## Run
 
-Install the packages in `requirements.txt`, create a local `.env`, then run:
+Create a virtual environment and install the dependencies:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python3 -m pip install -r requirements.txt
+cp .env.example .env
+```
+
+Fill `API_ID`, `API_HASH`, and `PHONE` in your local `.env` file. Get your API
+credentials from [my.telegram.org](https://my.telegram.org). `PHONE` is the phone
+number of your Telegram account, including the country code. The first run may
+ask for the Telegram login code and your two-step verification password.
+
+Then run:
+
+```bash
 python3 telegram_stats_bot.py
 ```
 
-The required `.env` variables are:
-
-```dotenv
-API_ID=123456
-API_HASH=your_telegram_api_hash
-PHONE=+79990000000
-# Optional. Defaults to output.
-OUTPUT_DIR=output
-```
-
 `API_ID`, `API_HASH`, and `PHONE` are read only at runtime, so importing the
-module and running its fake-client tests does not require secrets.
+module and running its fake-client tests does not require secrets. `OUTPUT_DIR`
+is optional and defaults to `output`.
 
-On the current workspace, `/usr/bin/python3` has the required Telethon package:
+Run the offline tests with the same interpreter:
 
 ```bash
-/usr/bin/python3 -m unittest -v
+python3 -m unittest -v
 ```
 
 ## Interactive input
@@ -103,6 +107,12 @@ silently overwritten.
 The exporter accesses only channels already available to the authenticated
 account. It never joins a channel automatically. Downloaded media and session
 files may contain sensitive data; keep them out of version control.
+The repository ignores local credentials, Telegram sessions, downloaded media
+and generated exports. `.env.example` contains empty placeholders only; never
+put real credentials in it or publish your `.session` files.
+
+`telegram_stats_bot.py` is the supported exporter. The other scripts are legacy
+utilities; `export_marketing_chat.py` supplies its reused media parser.
 
 ## Verification scope
 
