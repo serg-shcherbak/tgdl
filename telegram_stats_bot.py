@@ -1,9 +1,10 @@
 from telethon import TelegramClient
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Iterable, Mapping
 import json
+import argparse
 import asyncio
 import csv
 import copy
@@ -19,9 +20,11 @@ from dotenv import load_dotenv
 try:
     from telethon.errors import FloodWaitError
     from telethon.tl import functions as tl_functions
+    from telethon.tl import types as tl_types
 except ImportError:  # pragma: no cover - Telethon is a runtime dependency.
     FloodWaitError = type('FloodWaitError', (Exception,), {})
     tl_functions = None
+    tl_types = None
 
 load_dotenv()
 
@@ -381,6 +384,53 @@ def _iter_comment_spool(path: str) -> Iterable[Mapping[str, Any]]:
                 yield json.loads(line)
 
 
+def _load_saved_export(folder: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    assert_generation_consistent(folder)
+    with open(os.path.join(folder, 'channel.csv'), encoding='utf-8', newline='') as stream:
+        channel = next(csv.DictReader(stream))
+    channel['channel_id'] = int(channel['channel_id'])
+    if channel['channel_id'] <= 0:
+        raise ValueError('invalid saved channel ID')
+    channel['linked_discussion_id'] = int(channel['linked_discussion_id']) if channel.get('linked_discussion_id') else ''
+    with open(os.path.join(folder, 'posts.csv'), encoding='utf-8', newline='') as stream:
+        reader = csv.DictReader(stream)
+        required = {'channel_id', 'post_id', 'date', 'text', 'comments_count', 'comments_export_status'}
+        if not required.issubset(reader.fieldnames or ()) or len(set(reader.fieldnames)) != len(reader.fieldnames):
+            raise ValueError('posts.csv has an unsupported schema')
+        posts = list(reader)
+    seen_posts = set()
+    for post in posts:
+        for field in ('channel_id', 'post_id', 'message_id', 'grouped_id', 'media_order',
+                      'views', 'forwards', 'reactions', 'comments_count', 'comments_exported', 'discussion_id'):
+            post[field] = int(post[field]) if post.get(field) else ''
+        if post['channel_id'] != channel['channel_id'] or not post['post_id'] or post['post_id'] <= 0 or post['post_id'] in seen_posts:
+            raise ValueError('posts.csv contains foreign or duplicate post IDs')
+        seen_posts.add(post['post_id'])
+        post['message_id'] = post['message_id'] or post['post_id']
+        post['comments_count'] = post['comments_count'] or 0
+        if post['comments_count'] < 0:
+            raise ValueError('negative saved comment count')
+        post['discussion_id'] = post['discussion_id'] or channel['linked_discussion_id']
+        post['comments_available'] = str(post.get('comments_available', '')).lower() == 'true'
+        post.setdefault('text_entities_json', '[]')
+        post.setdefault('media_status', 'metadata_only' if post.get('media_type') else 'none')
+        post.setdefault('media_local_path', '')
+    return channel, posts
+
+
+async def resume_comments(client: Any, folder: str) -> Dict[str, Any]:
+    """Add unfinished comment threads to a verified local post snapshot."""
+    folder = os.path.realpath(os.path.abspath(os.fspath(folder)))
+    channel, posts = _load_saved_export(folder)
+    source = channel.get('username') or tl_types.PeerChannel(channel['channel_id'])
+    entity = await client.get_entity(source)
+    if getattr(entity, 'id', None) != channel['channel_id']:
+        raise ChannelFolderError('resolved Telegram channel does not own this saved export')
+    start, end = parse_date_range(channel['period_start'], channel['period_end'])
+    return await process_channel(client, str(source), start, end, comments_requested=True,
+                                 resolved_entity=entity, _saved_export=(folder, channel, posts))
+
+
 def publish_export(
     folder: str,
     channel_row: Mapping[str, Any],
@@ -682,7 +732,7 @@ def _flood_seconds(exc: BaseException) -> Optional[int]:
 
 
 def _is_flood_wait(exc: BaseException) -> bool:
-    return isinstance(exc, FloodWaitError) or type(exc).__name__ == 'FloodWaitError'
+    return isinstance(exc, FloodWaitError) or type(exc).__name__ in {'FloodWaitError', 'FloodPremiumWaitError'}
 
 
 def _is_long_flood_wait(exc: BaseException, client: Any) -> bool:
@@ -695,6 +745,57 @@ def _is_long_flood_wait(exc: BaseException, client: Any) -> bool:
 
 def _is_no_space(exc: BaseException) -> bool:
     return isinstance(exc, OSError) and getattr(exc, 'errno', None) == errno.ENOSPC
+
+
+class ExportClient(TelegramClient):
+    """Pace history/reply pages across workers and share Telegram cooldowns."""
+
+    def __init__(self, *args, **kwargs):
+        # Handle waits here so a sleeping worker cannot leave others sending requests.
+        kwargs['flood_sleep_threshold'] = 0
+        kwargs['receive_updates'] = False
+        super().__init__(*args, **kwargs)
+        self._page_lock = asyncio.Lock()
+        self._page_interval = 1.0
+        self._next_page_at = 0.0
+        self._resume_at = 0.0
+        self._export_fatal = None
+
+    async def _wait_export_request(self, paged):
+        loop = asyncio.get_running_loop()
+        while True:
+            if self._export_fatal is not None:
+                raise self._export_fatal
+            due = max(self._resume_at, self._next_page_at if paged else 0)
+            delay = due - loop.time()
+            if delay <= 0:
+                if paged:
+                    self._next_page_at = loop.time() + self._page_interval
+                return
+            await asyncio.sleep(delay)
+
+    async def _call(self, sender, request, ordered=False, flood_sleep_threshold=None):
+        # Telethon 1.43.2 routes media and iterator requests through this seam.
+        paged = isinstance(request, (tl_functions.messages.GetHistoryRequest,
+                                     tl_functions.messages.GetRepliesRequest))
+        for attempt in range(4):
+            if paged:
+                async with self._page_lock:
+                    await self._wait_export_request(True)
+            else:
+                await self._wait_export_request(False)
+            try:
+                return await super()._call(sender, request, ordered=ordered, flood_sleep_threshold=0)
+            except Exception as exc:
+                if not _is_flood_wait(exc):
+                    raise
+                seconds = _flood_seconds(exc)
+                if seconds is None or seconds > FLOOD_WAIT_THRESHOLD or attempt == 3:
+                    self._export_fatal = RunFatalError(f'Flood wait: {seconds} seconds; export stopped')
+                    raise self._export_fatal from exc
+                self._resume_at = max(self._resume_at, asyncio.get_running_loop().time() + max(1, seconds))
+                self._page_interval = min(5.0, self._page_interval * 2)
+                print(f'\nTelegram запросил паузу {seconds} с; все новые запросы приостановлены.', flush=True)
 
 
 def _text_fields(message: Any) -> Dict[str, Any]:
@@ -781,8 +882,11 @@ protected — защищено от скачивания; download_failed — о
 Для отсутствующего файла оставь понятную заглушку с известным типом; не создавай фиктивную ссылку.
 media_extra_json — JSON-строка с расширенными атрибутами. Фото, видео, аудио и документы различаются по media_type/MIME.
 comments_count — счетчик Telegram; comments_exported — реально записанные комментарии.
-comments_export_status различает not_requested, disabled, unavailable, complete, partial и failed.
-Нулевое число записей не всегда означает отсутствие комментариев. Не выдавай partial/failed за полную ветку.
+Посты публикуются до чтения комментариев; pending означает, что ветка еще ожидает выгрузки.
+comments_export_status различает not_requested, disabled, unavailable, pending, complete, partial, failed и interrupted.
+Нулевое число записей не всегда означает отсутствие комментариев. Не выдавай pending/partial/failed/interrupted за полную ветку.
+Догрузка комментариев продолжает сохраненный срез: готовые ветки пропускаются, незавершенные читаются ниже сохраненного ID.
+Новые посты, правки и новые ответы выше сохраненного ID при догрузке не обновляются; для актуального среза нужна новая выгрузка.
 subscriber_count и остальные сведения channel.csv описывают доступную информацию на момент экспорта; пустое значение неизвестно, а не ноль.
 
 ## Схема CSV
@@ -881,6 +985,7 @@ async def process_channel(
     download_media: Optional[bool] = None,
     output_dir: str = OUTPUT_DIR,
     resolved_entity: Any = None,
+    _saved_export: Optional[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     start_date, end_date = validate_date_range(start_date, end_date)
     # Keep existing Python callers compatible; the interactive input uses N/P/V/A.
@@ -890,7 +995,7 @@ async def process_channel(
     if media_mode not in {'N', 'P', 'V', 'A'}:
         raise ValueError('media_mode must be N, P, V, or A')
     entity = resolved_entity if resolved_entity is not None else await client.get_entity(channel)
-    folder = select_channel_folder(output_dir, entity)
+    folder = _saved_export[0] if _saved_export else select_channel_folder(output_dir, entity)
     export_id = uuid.uuid4().hex
     created_media = set()
     comment_spool_path = None
@@ -900,6 +1005,12 @@ async def process_channel(
     snapshot = None
     producer = None
     workers = []
+    comment_workers = []
+    progress = None
+    comments_loaded = 0
+    threads_done = 0
+    pending_comments = []
+    last_progress = 0.0
     # shortcut: pending metadata scales with attachments; spool jobs if large exports exhaust memory.
     queue = asyncio.Queue()
     fatal = asyncio.get_running_loop().create_future()
@@ -908,6 +1019,8 @@ async def process_channel(
     album_order = {}
     jobs = 0
     posts = []
+    seen_comments = set()
+    comment_offsets = {}
 
     def record_key(row):
         if row.get('record_type') == 'comment':
@@ -930,8 +1043,10 @@ async def process_channel(
             row['media_order'] = album_order[album_key(row)][row.get('comment_id', row.get('message_id'))]
         if final:
             row.update(media_results.get(record_key(row), {}))
-            if row['media_status'] == 'pending':
+            if row['media_status'] == 'pending' and not _saved_export:
                 row['media_status'] = 'interrupted'
+            if row.get('comments_export_status') == 'pending':
+                row['comments_export_status'] = 'partial' if row['comments_exported'] else 'interrupted'
         return row
 
     def schedule_media(message, row, info, downloadable):
@@ -971,8 +1086,8 @@ async def process_channel(
                     created_media.add(os.path.join(folder, path))
                 media_results[key] = {'media_status': 'downloaded', 'media_local_path': path}
             except Exception as exc:
-                if _is_long_flood_wait(exc, client) or _is_no_space(exc):
-                    error = RunFatalError(f'Flood wait: {_flood_seconds(exc)} seconds' if _is_long_flood_wait(exc, client) else 'disk full while downloading media')
+                if isinstance(exc, RunFatalError) or _is_long_flood_wait(exc, client) or _is_no_space(exc):
+                    error = exc if isinstance(exc, RunFatalError) else RunFatalError(f'Flood wait: {_flood_seconds(exc)} seconds' if _is_long_flood_wait(exc, client) else 'disk full while downloading media')
                     if not fatal.done():
                         fatal.set_result(error)
                     for task in workers:
@@ -985,12 +1100,36 @@ async def process_channel(
                 print(f"\nНе удалось скачать вложение {stem}: {exc}")
 
     async def wait_or_fatal(task):
-        await asyncio.wait((task, fatal), return_when=asyncio.FIRST_COMPLETED)
-        if fatal.done():
-            raise fatal.result()
-        return await task
+        try:
+            await asyncio.wait((task, fatal), return_when=asyncio.FIRST_COMPLETED)
+            if fatal.done():
+                raise fatal.result()
+            return await task
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    def show_progress(force=False):
+        nonlocal last_progress
+        now = asyncio.get_running_loop().time()
+        if force or now - last_progress >= 0.5:
+            print(f"\r{progress_label} — постов: {len(posts)} | комментов: {comments_loaded}"
+                  f" | веток: {threads_done}/{len(pending_comments)} | медиа: {len(media_results)}/{jobs}",
+                  end='', flush=True)
+            last_progress = now
+
+    async def report_progress():
+        while True:
+            await asyncio.sleep(1)
+            show_progress()
 
     def publish(revision, status, final):
+        nonlocal album_order
+        if comment_spool is not None and not comment_spool.closed:
+            comment_spool.flush()
+        album_order = {key: {message_id: index for index, message_id in enumerate(sorted(ids), 1)}
+                       for key, ids in album_members.items()}
         channel_row['export_revision'] = revision
         channel_row['media_export_status'] = status
         comments = (apply_results(row, final) for row in _iter_comment_spool(comment_spool_path)) if comment_spool_path else ()
@@ -999,7 +1138,8 @@ async def process_channel(
 
     async def collect():
         try:
-            async for message in client.iter_messages(entity):
+            # Telegram's date offset is exclusive and has whole-second precision.
+            async for message in client.iter_messages(entity, offset_date=end_date + timedelta(seconds=1)):
                 message_date = _utc_datetime(getattr(message, 'date', None))
                 if message_date is None:
                     continue
@@ -1036,26 +1176,13 @@ async def process_channel(
                 elif discussion_id is None:
                     comments_status, comments_available = 'unavailable', False
                 else:
-                    comments_available = True
-                    try:
-                        async for comment in client.iter_messages(entity, reply_to=message.id):
-                            info, downloadable_comment = _media_metadata(comment)
-                            row = _comment_row(comment, entity, message.id, discussion_id, info)
-                            track_album(row, downloadable_comment)
-                            schedule_media(comment, row, info, downloadable_comment)
-                            comment_spool.write(json.dumps(row, ensure_ascii=False, separators=(',', ':')) + '\n')
-                            comments_exported += 1
-                            await asyncio.sleep(0)
-                        comments_status = 'complete' if comments_exported == server_comments else 'partial'
-                    except Exception as exc:
-                        if isinstance(exc, RunFatalError) or _is_long_flood_wait(exc, client) or _is_no_space(exc):
-                            raise
-                        comments_status = 'partial' if comments_exported else 'failed'
+                    comments_status, comments_available = 'pending', True
+                    pending_comments.append(post)
                 post.update(comments_count=server_comments, comments_exported=comments_exported,
                             comments_available=comments_available, comments_export_status=comments_status,
                             discussion_id=_value_or_empty(discussion_id))
                 posts.append(post)
-                print(f"\r{progress_label} — постов: {len(posts)}", end='', flush=True)
+                show_progress()
                 await asyncio.sleep(0)
         except Exception as exc:
             if isinstance(exc, RunFatalError) or _is_long_flood_wait(exc, client) or _is_no_space(exc):
@@ -1065,54 +1192,149 @@ async def process_channel(
                     task.cancel()
             raise
 
+    async def collect_comments():
+        nonlocal comments_loaded, threads_done
+        for post in comment_posts:
+            if fatal.done():
+                return
+            try:
+                options = {'offset_id': comment_offsets[post['post_id']]} if post['post_id'] in comment_offsets else {}
+                async for comment in client.iter_messages(entity, reply_to=post['post_id'], **options):
+                    key = (post['post_id'], comment.id)
+                    if key in seen_comments:
+                        continue
+                    info, downloadable = _media_metadata(comment)
+                    row = _comment_row(comment, entity, post['post_id'], post['discussion_id'], info)
+                    track_album(row, downloadable)
+                    schedule_media(comment, row, info, downloadable)
+                    comment_spool.write(json.dumps(row, ensure_ascii=False, separators=(',', ':')) + '\n')
+                    seen_comments.add(key)
+                    post['comments_exported'] += 1
+                    comments_loaded += 1
+                    show_progress()
+                    await asyncio.sleep(0)
+                    if fatal.done():
+                        return
+                post['comments_export_status'] = ('complete' if post['comments_exported'] == post['comments_count'] else 'partial')
+            except Exception as exc:
+                if isinstance(exc, RunFatalError) or _is_long_flood_wait(exc, client) or _is_no_space(exc):
+                    if not fatal.done():
+                        fatal.set_result(exc)
+                    raise
+                post['comments_export_status'] = 'partial' if post['comments_exported'] else 'failed'
+                print(f"\nНе удалось завершить комментарии поста {post['post_id']}: {exc}", flush=True)
+            threads_done += 1
+            show_progress()
+
     try:
         if comments_requested:
             comment_spool_path = _make_temp(folder, 'comments.spool.jsonl')
             comment_spool = open(comment_spool_path, 'w', encoding='utf-8', newline='')
-        full = await _get_full_channel(client, entity)
-        channel_row = _channel_row(entity, full, start_date, end_date)
+        if _saved_export:
+            channel_row, posts = _saved_export[1:]
+            posts_by_id = {post['post_id']: post for post in posts}
+            for post in posts:
+                post['comments_exported'] = 0
+                track_album(post, bool(post.get('media_order')))
+            for row in _iter_comment_spool(os.path.join(folder, 'comments.jsonl')):
+                if row.get('record_type') == 'run_control':
+                    continue
+                if row.get('record_type') != 'comment' or str(row.get('channel_id')) != str(channel_row['channel_id']):
+                    raise ValueError('comment record does not belong to this channel')
+                row = dict(row)
+                for field in ('channel_id', 'source_post_id', 'discussion_chat_id', 'comment_id'):
+                    row[field] = int(row[field])
+                post_id, comment_id = row['source_post_id'], row['comment_id']
+                post = posts_by_id.get(post_id)
+                if post is None or comment_id <= 0 or row['discussion_chat_id'] != post['discussion_id']:
+                    raise ValueError('comment record does not belong to its saved post/thread')
+                key = (post_id, comment_id)
+                if key in seen_comments:
+                    continue
+                seen_comments.add(key)
+                row['grouped_id'] = int(row['grouped_id']) if row.get('grouped_id') else ''
+                track_album(row, bool(row.get('media_order')))
+                comment_spool.write(json.dumps(row, ensure_ascii=False, separators=(',', ':')) + '\n')
+                post['comments_exported'] += 1
+                comments_loaded += 1
+                comment_offsets[post_id] = min(comment_offsets.get(post_id, comment_id), comment_id)
+            for post in posts:
+                status = post['comments_export_status']
+                if status in {'disabled', 'unavailable'}:
+                    continue
+                if status == 'complete' and post['comments_exported'] == post['comments_count']:
+                    continue
+                if not post['comments_count']:
+                    post['comments_export_status'] = 'complete' if post['comments_available'] else 'disabled'
+                elif not post['discussion_id']:
+                    post['comments_export_status'] = 'unavailable'
+                else:
+                    post['comments_export_status'] = 'pending'
+                    pending_comments.append(post)
+            if not pending_comments:
+                print('Комментарии к сохраненным постам уже выгружены.', flush=True)
+                return {'channel': channel_row, 'folder': folder, 'posts': posts, 'export_id': channel_row['export_id']}
+        else:
+            full = await _get_full_channel(client, entity)
+            channel_row = _channel_row(entity, full, start_date, end_date)
+        saved_media_status = channel_row.get('media_export_status', 'not_requested')
         channel_row.update(export_id=export_id, comments_requested=comments_requested)
         discussion_default = channel_row.get('linked_discussion_id') or None
         media_dir = os.path.join(folder, 'media')
         channel_title = channel_row.get('title') or channel_row.get('username') or channel_row.get('channel_id')
-        progress_label = f"⏳ Выгружаю {channel_title}"
-        print(f"\r{progress_label} — постов: 0", end='', flush=True)
+        progress_label = (f"⏳ Догружаю комментарии {channel_title}" if _saved_export else f"⏳ Выгружаю {channel_title}")
+        show_progress(force=True)
         progress_started = True
+        progress = asyncio.create_task(report_progress())
         workers = [asyncio.create_task(download_worker()) for _ in range(3)] if media_mode != 'N' else []
-        producer = asyncio.create_task(collect())
-        await wait_or_fatal(producer)
+        if not _saved_export:
+            producer = asyncio.create_task(collect())
+            await wait_or_fatal(producer)
+        show_progress(force=True)
+        if not _saved_export:
+            posts.sort(key=lambda row: (row.get(sort_key) or 0) if sort_key != 'date' else row['date'],
+                       reverse=sort_key in {'forwards', 'reactions'})
+        _write_export_agents(folder, export_id)
+        if _saved_export:
+            snapshot = _save_text_snapshot(folder, export_id)
+        publish(1, saved_media_status if _saved_export else ('not_requested' if media_mode == 'N' else ('downloading' if jobs or pending_comments else 'complete')), False)
+        text_published = True
+        if _saved_export:
+            print(f"\nИспользую сохраненные посты: {folder}", flush=True)
+        else:
+            print(f"\nПосты готовы: {folder} (комментарии и медиа могут еще загружаться)", flush=True)
+        if (jobs or pending_comments) and snapshot is None:
+            snapshot = _save_text_snapshot(folder, export_id)
+        comment_posts = iter(pending_comments)
+        comment_workers = [asyncio.create_task(collect_comments()) for _ in range(min(2, len(pending_comments)))]
+        await wait_or_fatal(asyncio.gather(*comment_workers))
         if comment_spool is not None:
             comment_spool.close()
-        album_order = {key: {message_id: index for index, message_id in enumerate(sorted(ids), 1)}
-                       for key, ids in album_members.items()}
-        posts.sort(key=lambda row: (row.get(sort_key) or 0) if sort_key != 'date' else row['date'],
-                   reverse=sort_key in {'forwards', 'reactions'})
-        _write_export_agents(folder, export_id)
-        publish(1, 'downloading' if jobs else ('not_requested' if media_mode == 'N' else 'complete'), False)
-        text_published = True
-        print(f"\nТексты готовы: {folder}", flush=True)
-        if jobs:
-            snapshot = _save_text_snapshot(folder, export_id)
+        show_progress(force=True)
         for _ in workers:
             queue.put_nowait(None)
         await wait_or_fatal(asyncio.gather(*workers, return_exceptions=True))
-        if jobs:
+        if jobs or pending_comments:
             status = 'partial' if any(row['media_status'] == 'download_failed' for row in media_results.values()) else 'complete'
+            if media_mode == 'N':
+                status = 'not_requested'
+            if _saved_export:
+                status = saved_media_status
             publish(2, status, True)
             assert_generation_consistent(folder)
             shutil.rmtree(snapshot)
             snapshot = None
-            print(f"Медиа завершены: {len(media_results)}/{jobs}, статус: {status}", flush=True)
+            print(f"\nЭкспорт завершен: постов {len(posts)}, комментов {comments_loaded}, медиа {len(media_results)}/{jobs}", flush=True)
         posts = [apply_results(row, True) for row in posts]
         return {'channel': channel_row, 'folder': folder, 'posts': posts, 'export_id': export_id}
     except BaseException:
-        for task in [producer, *workers]:
+        for task in [producer, *comment_workers, *workers, progress]:
             if task is not None:
                 task.cancel()
-        await asyncio.gather(*(task for task in [producer, *workers] if task is not None), return_exceptions=True)
+        await asyncio.gather(*(task for task in [producer, *comment_workers, *workers, progress] if task is not None), return_exceptions=True)
         if text_published and snapshot:
             try:
-                publish(2, 'interrupted', True)
+                publish(2, saved_media_status if _saved_export else ('not_requested' if media_mode == 'N' else 'interrupted'), True)
                 assert_generation_consistent(folder)
                 shutil.rmtree(snapshot)
                 snapshot = None
@@ -1122,6 +1344,11 @@ async def process_channel(
                 except OSError:
                     pass  # The unchanged snapshot remains readable even if restoring the root fails.
         if not text_published:
+            if snapshot:
+                try:
+                    _restore_text_snapshot(folder, snapshot)
+                except OSError:
+                    pass
             for path in created_media:
                 try:
                     os.unlink(path)
@@ -1130,10 +1357,10 @@ async def process_channel(
         raise
     finally:
         fatal.cancel()
-        for task in [producer, *workers]:
+        for task in [producer, *comment_workers, *workers, progress]:
             if task is not None and not task.done():
                 task.cancel()
-        await asyncio.gather(*(task for task in [producer, *workers] if task is not None), return_exceptions=True)
+        await asyncio.gather(*(task for task in [producer, *comment_workers, *workers, progress] if task is not None), return_exceptions=True)
         if progress_started:
             print()
         if comment_spool is not None and not comment_spool.closed:
@@ -1257,19 +1484,50 @@ def _print_export_summary(result: Mapping[str, Any]) -> None:
             print(f"     Дата:  {post.get('date') or ''}\n")
 
 
-async def main():
+async def main(argv=None):
+    parser = argparse.ArgumentParser(description='Экспорт каналов Telegram и догрузка комментариев')
+    parser.add_argument('--resume-comments', metavar='FOLDER', help='догрузить комментарии в папку готовой выгрузки')
+    args = parser.parse_args(argv)
     try:
         config = load_runtime_config()
     except RuntimeConfigError as exc:
         print(str(exc))
         return 1
 
-    channels = ask_channel_source()
-    settings = collect_run_settings()
-    client = TelegramClient('session_name', config.api_id, config.api_hash)
+    resume_folder = args.resume_comments
+    if not resume_folder:
+        print('\n1 — новая выгрузка (Enter); 2 — догрузить комментарии к сохраненным постам')
+        while True:
+            operation = input('Режим [1/2]: ').strip() or '1'
+            if operation in {'1', '2'}:
+                break
+            print('Введите 1 или 2.')
+        if operation == '2':
+            resume_folder = input('Папка выгрузки, например output/shcherbaks: ').strip().strip('\"\'')
+            if not resume_folder:
+                print('Путь к папке не указан.')
+                return 1
+    if resume_folder:
+        try:
+            _load_saved_export(resume_folder)
+        except (OSError, ValueError, KeyError, TypeError, csv.Error) as exc:
+            print(f'Не удалось прочитать выгрузку: {exc}')
+            return 1
+    else:
+        channels = ask_channel_source()
+        settings = collect_run_settings()
+    client = ExportClient('session_name', config.api_id, config.api_hash)
     await client.start(phone=config.phone)
     print("\n🔑 Авторизация успешна!")
     try:
+        if resume_folder:
+            try:
+                saved = await resume_comments(client, resume_folder)
+            except Exception as exc:
+                print(f'Догрузка остановлена: {exc}')
+                return 1
+            print(f"Комментарии сохранены: {saved['folder']}")
+            return 0
         result = await run_exports(
             client,
             channels,

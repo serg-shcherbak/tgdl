@@ -2,15 +2,17 @@ import asyncio
 import csv
 import errno
 import io
+from itertools import chain
+from pathlib import Path
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import telegram_stats_bot as bot
 
@@ -50,6 +52,7 @@ class FakeClient:
         self.entity_calls = []
         self.iter_calls = []
         self.download_calls = []
+        self.iter_options = []
 
     async def get_entity(self, value):
         self.entity_calls.append(value)
@@ -66,13 +69,16 @@ class FakeClient:
             )
         )
 
-    async def iter_messages(self, entity, reply_to=None):
+    async def iter_messages(self, entity, reply_to=None, **kwargs):
         if reply_to is not None and getattr(entity, "id", entity) == 99:
             raise AssertionError("comment iterator must receive source channel entity")
         key = (getattr(entity, "id", entity), reply_to)
         self.iter_calls.append(key)
+        self.iter_options.append(kwargs)
         values = self.comments.get(key, []) if reply_to is not None else self.posts.get(getattr(entity, "id", entity), [])
         for value in values:
+            if reply_to is not None and kwargs.get('offset_id') and value.id >= kwargs['offset_id']:
+                continue
             yield value
 
     async def download_media(self, message, file):
@@ -89,7 +95,7 @@ class FloodWaitError(Exception):
 
 
 class LongWaitClient(FakeClient):
-    async def iter_messages(self, entity, reply_to=None):
+    async def iter_messages(self, entity, reply_to=None, **kwargs):
         key = (getattr(entity, "id", entity), reply_to)
         self.iter_calls.append(key)
         if reply_to is None and getattr(entity, "id", None) == 1:
@@ -100,6 +106,428 @@ class LongWaitClient(FakeClient):
 
 
 class TelegramExportTests(unittest.TestCase):
+    def test_resume_adds_comments_without_fetching_posts_or_media(self):
+        entity = SimpleNamespace(id=1, title='Channel', username='channel')
+        post = FakeMessage(1, '2026-08-20', 'saved post', media=SimpleNamespace(kind='photo', id=11),
+                           replies=SimpleNamespace(replies=3, channel_id=99))
+        disabled = FakeMessage(2, '2026-08-20', 'no comments')
+        original = FakeClient({'channel': entity}, {1: [post, disabled]})
+        comments = [FakeMessage(i, '2020-01-01', f'comment {i}') for i in (103, 102, 101)]
+        client = FakeClient({'channel': entity}, {}, {(1, 1): comments})
+        with tempfile.TemporaryDirectory() as output:
+            saved = asyncio.run(bot.process_channel(original, 'channel', dt('2026-08-20'), dt('2026-08-20'),
+                                media_mode='A', output_dir=output))
+            old_media = saved['posts'][0]['media_local_path']
+            with patch.object(client, 'get_full_channel', side_effect=AssertionError('metadata must not be refetched')):
+                result = asyncio.run(bot.resume_comments(client, saved['folder']))
+            self.assertEqual(client.iter_calls, [(1, 1)])
+            self.assertEqual(client.download_calls, [])
+            self.assertEqual(result['posts'][0]['text'], 'saved post')
+            self.assertEqual(result['posts'][0]['media_local_path'], old_media)
+            self.assertEqual(result['posts'][0]['media_status'], 'downloaded')
+            self.assertEqual(result['channel']['media_export_status'], 'complete')
+            self.assertTrue(os.path.isfile(os.path.join(saved['folder'], old_media)))
+            self.assertEqual(result['posts'][0]['comments_exported'], 3)
+            self.assertEqual(result['posts'][0]['comments_export_status'], 'complete')
+            self.assertEqual(result['posts'][1]['comments_export_status'], 'disabled')
+            self.assertTrue(bot.verify_export_generation(saved['folder']))
+            # A second resume does no history, reply or download work and keeps the snapshot.
+            before = {name: (Path(saved['folder']) / name).read_bytes() for name in bot._DATA_FILES}
+            again = FakeClient({'channel': entity}, {})
+            asyncio.run(bot.resume_comments(again, saved['folder']))
+            self.assertEqual(again.iter_calls, [])
+            self.assertEqual(before, {name: (Path(saved['folder']) / name).read_bytes() for name in bot._DATA_FILES})
+
+    def test_resume_repeated_cancellation_uses_saved_cursor_and_skips_finished_threads(self):
+        async def scenario(output):
+            entity = SimpleNamespace(id=1, title='Channel', username='channel')
+            posts = [FakeMessage(i, '2026-08-20', f'post {i}',
+                     replies=SimpleNamespace(replies=3 if i == 1 else 1, channel_id=99)) for i in (1, 2)]
+            await bot.process_channel(FakeClient({'channel': entity}, {1: posts}), 'channel',
+                  dt('2026-08-20'), dt('2026-08-20'), output_dir=output)
+            folder = os.path.join(output, 'channel')
+            comments = {(1, 1): [FakeMessage(i, '2020-01-01', f'comment {i}') for i in (103, 102, 101)],
+                        (1, 2): [FakeMessage(201, '2020-01-01', 'finished thread')]}
+
+            class Interruptible(FakeClient):
+                async def iter_messages(self, entity, reply_to=None, **kwargs):
+                    async for row in super().iter_messages(entity, reply_to, **kwargs):
+                        yield row
+                        if reply_to == 1:
+                            await blocked.wait()
+                            ready.set()
+                            await asyncio.Event().wait()
+                    if reply_to == 2:
+                        blocked.set()
+
+            for expected_offset in (None, 103):
+                ready, blocked = asyncio.Event(), asyncio.Event()
+                client = Interruptible({'channel': entity}, {}, comments)
+                task = asyncio.create_task(bot.resume_comments(client, folder))
+                try:
+                    if expected_offset:
+                        blocked.set()  # The other thread was completed during the first pass.
+                    await asyncio.wait_for(ready.wait(), 3)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    options = client.iter_options[client.iter_calls.index((1, 1))]
+                    self.assertEqual(options.get('offset_id'), expected_offset)
+                    if expected_offset:
+                        self.assertNotIn((1, 2), client.iter_calls)
+                    self.assertTrue(bot.verify_export_generation(folder))
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            final = FakeClient({'channel': entity}, {}, comments)
+            result = await bot.resume_comments(final, folder)
+            self.assertEqual(final.iter_calls, [(1, 1)])
+            self.assertEqual(final.iter_options, [{'offset_id': 102}])
+            self.assertEqual([p['comments_exported'] for p in result['posts']], [3, 1])
+            self.assertTrue(all(p['comments_export_status'] == 'complete' for p in result['posts']))
+            with open(os.path.join(folder, 'comments.jsonl'), encoding='utf-8') as stream:
+                rows = [json.loads(line) for line in stream][1:]
+            self.assertEqual(sorted(row['comment_id'] for row in rows), [101, 102, 103, 201])
+            self.assertFalse(any(name.endswith('.tmp') for _, _, names in os.walk(output) for name in names))
+            self.assertEqual([t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()], [])
+        with tempfile.TemporaryDirectory() as output:
+            asyncio.run(scenario(output))
+
+    def test_resume_refuses_foreign_corrupt_or_user_owned_exports(self):
+        entity = SimpleNamespace(id=1, title='Channel', username='channel')
+        post = FakeMessage(1, '2026-08-20', 'saved', replies=SimpleNamespace(replies=1, channel_id=99))
+        for failure in ('foreign', 'mixed', 'user_agents'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as output:
+                saved = asyncio.run(bot.process_channel(FakeClient({'channel': entity}, {1: [post]}), 'channel',
+                        dt('2026-08-20'), dt('2026-08-20'), output_dir=output))
+                folder = saved['folder']
+                client = FakeClient({'channel': entity}, {}, {(1, 1): [FakeMessage(101, '2020-01-01', 'comment')]})
+                if failure == 'foreign':
+                    client.entities['channel'] = SimpleNamespace(id=2)
+                elif failure == 'mixed':
+                    path = os.path.join(folder, 'comments.jsonl')
+                    with open(path, encoding='utf-8') as stream:
+                        control = json.loads(stream.readline())
+                    control['export_id'] = 'another-export'
+                    with open(path, 'w', encoding='utf-8') as stream:
+                        stream.write(json.dumps(control) + '\n')
+                else:
+                    with open(os.path.join(folder, 'AGENTS.md'), 'w', encoding='utf-8') as stream:
+                        stream.write('user instructions')
+                before = {name: (Path(folder) / name).read_bytes() for name in bot._DATA_FILES}
+                with self.assertRaises((bot.ChannelFolderError, ValueError)):
+                    asyncio.run(bot.resume_comments(client, folder))
+                self.assertEqual(client.iter_calls, [])
+                self.assertEqual(before, {name: (Path(folder) / name).read_bytes() for name in bot._DATA_FILES})
+
+    def test_resume_rolls_back_failed_first_publication(self):
+        entity = SimpleNamespace(id=1, title='Channel', username='channel')
+        post = FakeMessage(1, '2026-08-20', 'saved', replies=SimpleNamespace(replies=1, channel_id=99))
+        with tempfile.TemporaryDirectory() as output:
+            saved = asyncio.run(bot.process_channel(FakeClient({'channel': entity}, {1: [post]}), 'channel',
+                    dt('2026-08-20'), dt('2026-08-20'), output_dir=output))
+            folder = saved['folder']
+            before = {name: (Path(folder) / name).read_bytes() for name in bot._DATA_FILES}
+            replace = bot.os.replace
+            failed = False
+            def fail(source, target):
+                nonlocal failed
+                if target == os.path.join(folder, 'posts.csv') and not failed:
+                    failed = True
+                    raise OSError(errno.ENOSPC, 'disk full')
+                return replace(source, target)
+            client = FakeClient({'channel': entity}, {})
+            with patch.object(bot.os, 'replace', side_effect=fail):
+                with self.assertRaises(OSError):
+                    asyncio.run(bot.resume_comments(client, folder))
+            self.assertTrue(bot.verify_export_generation(folder))
+            self.assertEqual(before, {name: (Path(folder) / name).read_bytes() for name in bot._DATA_FILES})
+            self.assertEqual(client.iter_calls, [])
+
+    def test_resume_cli_and_interactive_mode_use_existing_folder_only(self):
+        entity = SimpleNamespace(id=1, title='Channel', username='channel')
+        post = FakeMessage(1, '2026-08-20', 'saved', replies=SimpleNamespace(replies=1, channel_id=99))
+        for interactive in (False, True):
+            with self.subTest(interactive=interactive), tempfile.TemporaryDirectory() as output:
+                saved = asyncio.run(bot.process_channel(FakeClient({'channel': entity}, {1: [post]}), 'channel',
+                        dt('2026-08-20'), dt('2026-08-20'), output_dir=output))
+                client = FakeClient({'channel': entity}, {}, {(1, 1): [FakeMessage(101, '2020-01-01', 'comment')]})
+                client.start = AsyncMock()
+                client.disconnect = AsyncMock()
+                config = bot.RuntimeConfig(123, 'offline', 'offline', output)
+                with patch.object(bot, 'ExportClient', return_value=client), \
+                     patch.object(bot, 'load_runtime_config', return_value=config), \
+                     patch('builtins.input', side_effect=['2', saved['folder']] if interactive else AssertionError('no prompts expected')):
+                    result = asyncio.run(bot.main([] if interactive else ['--resume-comments', saved['folder']]))
+                self.assertEqual(result, 0)
+                self.assertEqual(client.iter_calls, [(1, 1)])
+                client.start.assert_awaited_once_with(phone='offline')
+                client.disconnect.assert_awaited_once()
+
+    def test_resume_duplicate_saved_and_returned_comments_are_not_added_twice(self):
+        entity = SimpleNamespace(id=1, title='Channel', username='channel')
+        post = FakeMessage(1, '2026-08-20', 'saved', replies=SimpleNamespace(replies=3, channel_id=99))
+        first = FakeClient({'channel': entity}, {1: [post]}, {(1, 1): [FakeMessage(103, '2020-01-01', 'already saved')]})
+        class ReplayingClient(FakeClient):
+            async def iter_messages(self, entity, reply_to=None, **kwargs):
+                # A replayed boundary ID must not create a duplicate record.
+                async for row in super().iter_messages(entity, reply_to):
+                    yield row
+        with tempfile.TemporaryDirectory() as output:
+            saved = asyncio.run(bot.process_channel(first, 'channel', dt('2026-08-20'), dt('2026-08-20'),
+                                   comments_requested=True, output_dir=output))
+            path = os.path.join(saved['folder'], 'comments.jsonl')
+            with open(path, encoding='utf-8') as stream:
+                lines = list(stream)
+            with open(path, 'a', encoding='utf-8') as stream:
+                stream.write(lines[1])
+            client = ReplayingClient({'channel': entity}, {}, {(1, 1): [FakeMessage(i, '2020-01-01', 'comment') for i in (103, 102, 101)]})
+            result = asyncio.run(bot.resume_comments(client, saved['folder']))
+            self.assertEqual(result['posts'][0]['comments_exported'], 3)
+            with open(path, encoding='utf-8') as stream:
+                rows = [json.loads(line) for line in stream][1:]
+            self.assertEqual([row['comment_id'] for row in rows], [103, 102, 101])
+
+    def test_posts_are_published_before_two_bounded_comment_workers(self):
+        async def scenario(output):
+            release, started = asyncio.Event(), asyncio.Event()
+            entity = SimpleNamespace(id=1, title='Channel', username='channel')
+            posts = [FakeMessage(i, '2026-08-20', f'post {i}',
+                     replies=SimpleNamespace(replies=2, channel_id=99)) for i in range(1, 5)]
+            comments = {(1, i): [FakeMessage(i * 100 + j, '2020-01-01', 'comment')
+                         for j in (1, 2)] for i in range(1, 5)}
+
+            class SlowComments(FakeClient):
+                active = 0
+                maximum = 0
+                async def iter_messages(self, entity, reply_to=None, **kwargs):
+                    if reply_to is not None:
+                        self.active += 1
+                        self.maximum = max(self.maximum, self.active)
+                        if self.active == 2:
+                            started.set()
+                        try:
+                            await release.wait()
+                            async for row in super().iter_messages(entity, reply_to, **kwargs):
+                                yield row
+                        finally:
+                            self.active -= 1
+                    else:
+                        async for row in super().iter_messages(entity, **kwargs):
+                            yield row
+
+            client = SlowComments({'channel': entity}, {1: posts}, comments)
+            with patch('sys.stdout', new_callable=io.StringIO) as stdout:
+                task = asyncio.create_task(bot.run_exports(client, ['channel'], dt('2026-08-20'),
+                       dt('2026-08-20'), comments_requested=True, output_dir=output))
+                try:
+                    await asyncio.wait_for(started.wait(), 3)
+                    folder = os.path.join(output, 'channel')
+                    self.assertTrue(bot.verify_export_generation(folder))
+                    self.assertFalse(task.done())
+                    with open(os.path.join(folder, 'posts.csv'), encoding='utf-8', newline='') as stream:
+                        rows = list(csv.DictReader(stream))
+                    self.assertEqual(len(rows), 4)
+                    self.assertTrue(all(row['comments_export_status'] == 'pending' and
+                                        row['comments_exported'] == '0' for row in rows))
+                    with open(os.path.join(folder, 'comments.jsonl'), encoding='utf-8') as stream:
+                        self.assertEqual(len(list(stream)), 1)
+                    self.assertIn('Посты готовы:', stdout.getvalue())
+                    release.set()
+                    result = await asyncio.wait_for(task, 3)
+                    self.assertEqual(result['exit_code'], 0, result['failures'])
+                    self.assertEqual(client.maximum, 2)
+                    self.assertTrue(all(row['comments_exported'] == 2 for row in result['successes'][0]['posts']))
+                    self.assertIn('постов: 4 | комментов: 8 | веток: 4/4', stdout.getvalue())
+                finally:
+                    release.set()
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            self.assertEqual(client.active, 0)
+            self.assertEqual([t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()], [])
+
+        with tempfile.TemporaryDirectory() as output:
+            asyncio.run(scenario(output))
+
+    def test_cancelling_comments_keeps_posts_and_collected_comments(self):
+        async def scenario(output):
+            blocked = asyncio.Event()
+            entity = SimpleNamespace(id=1, title='Channel', username='channel')
+            posts = [FakeMessage(i, '2026-08-20', f'post {i}',
+                     replies=SimpleNamespace(replies=3, channel_id=99)) for i in (1, 2, 3)]
+
+            class PartialComments(FakeClient):
+                started = 0
+                async def iter_messages(self, entity, reply_to=None, **kwargs):
+                    if reply_to is None:
+                        async for row in super().iter_messages(entity, **kwargs):
+                            yield row
+                    else:
+                        yield FakeMessage(reply_to * 100, '2020-01-01', 'saved comment')
+                        self.started += 1
+                        if self.started == 2:
+                            blocked.set()
+                        await asyncio.Event().wait()
+
+            client = PartialComments({'channel': entity}, {1: posts})
+            task = asyncio.create_task(bot.process_channel(client, 'channel', dt('2026-08-20'),
+                   dt('2026-08-20'), comments_requested=True, output_dir=output))
+            try:
+                await asyncio.wait_for(blocked.wait(), 3)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                folder = os.path.join(output, 'channel')
+                self.assertTrue(bot.verify_export_generation(folder))
+                with open(os.path.join(folder, 'posts.csv'), encoding='utf-8', newline='') as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual(len(rows), 3)
+                self.assertEqual(sorted(row['comments_export_status'] for row in rows), ['interrupted', 'partial', 'partial'])
+                with open(os.path.join(folder, 'comments.jsonl'), encoding='utf-8') as stream:
+                    comments = [json.loads(line) for line in stream]
+                self.assertEqual(len(comments), 3)
+                self.assertEqual(sum(int(row['comments_exported']) for row in rows), 2)
+                self.assertTrue(all(row['export_revision'] == '2' for row in rows))
+                self.assertFalse(any(name.endswith('.tmp') for _, _, names in os.walk(output) for name in names))
+                self.assertEqual([t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()], [])
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        with tempfile.TemporaryDirectory() as output:
+            asyncio.run(scenario(output))
+
+    def test_comment_fatal_errors_keep_posts_and_stop_batch(self):
+        for failure in (FloodWaitError(120), OSError(errno.ENOSPC, 'disk full')):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as output:
+                entity = SimpleNamespace(id=1, title='Channel', username='channel')
+                post = FakeMessage(1, '2026-08-20', 'saved post', replies=SimpleNamespace(replies=2, channel_id=99))
+                class FatalComments(FakeClient):
+                    async def iter_messages(self, entity, reply_to=None, **kwargs):
+                        if reply_to is None:
+                            async for row in super().iter_messages(entity, **kwargs):
+                                yield row
+                        else:
+                            yield FakeMessage(101, '2020-01-01', 'saved comment')
+                            raise failure
+                client = FatalComments({'channel': entity, 'later': SimpleNamespace(id=2)}, {1: [post]})
+                result = asyncio.run(bot.run_exports(client, ['channel', 'later'], dt('2026-08-20'),
+                         dt('2026-08-20'), comments_requested=True, output_dir=output))
+                self.assertTrue(result['fatal_error'])
+                self.assertEqual(client.entity_calls, ['channel'])
+                folder = os.path.join(output, 'channel')
+                self.assertTrue(bot.verify_export_generation(folder))
+                with open(os.path.join(folder, 'posts.csv'), encoding='utf-8', newline='') as stream:
+                    row = next(csv.DictReader(stream))
+                self.assertEqual(row['text'], 'saved post')
+                self.assertEqual(row['comments_export_status'], 'partial')
+                self.assertEqual(row['comments_exported'], '1')
+
+    def test_cmd_c_after_posts_ready_keeps_export_in_cli_event_loop(self):
+        script = '''
+import asyncio, os, signal, sys
+from types import SimpleNamespace
+from test_telegram_stats_bot import FakeClient, FakeMessage, dt
+import telegram_stats_bot as bot
+entity = SimpleNamespace(id=1, title='Channel', username='channel')
+post = FakeMessage(1, '2026-08-20', 'saved post', replies=SimpleNamespace(replies=2, channel_id=99))
+class InterruptClient(FakeClient):
+    async def iter_messages(self, entity, reply_to=None, **kwargs):
+        if reply_to is None:
+            async for row in super().iter_messages(entity, **kwargs):
+                yield row
+        else:
+            yield FakeMessage(101, '2020-01-01', 'saved comment')
+            asyncio.get_running_loop().call_later(0.05, os.kill, os.getpid(), signal.SIGINT)
+            await asyncio.Event().wait()
+client = InterruptClient({'channel': entity}, {1: [post]})
+try:
+    asyncio.run(bot.process_channel(client, 'channel', dt('2026-08-20'), dt('2026-08-20'),
+                comments_requested=True, output_dir=sys.argv[1]))
+except KeyboardInterrupt:
+    pass
+'''
+        with tempfile.TemporaryDirectory() as output:
+            run = subprocess.run([sys.executable, '-c', script, output], capture_output=True, text=True, timeout=10)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertNotIn('never retrieved', run.stderr)
+            self.assertNotIn('Task was destroyed', run.stderr)
+            folder = os.path.join(output, 'channel')
+            self.assertTrue(bot.verify_export_generation(folder))
+            with open(os.path.join(folder, 'posts.csv'), encoding='utf-8', newline='') as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row['text'], 'saved post')
+            self.assertEqual(row['comments_export_status'], 'partial')
+            self.assertEqual(row['comments_exported'], '1')
+            with open(os.path.join(folder, 'comments.jsonl'), encoding='utf-8') as stream:
+                self.assertEqual(len(list(stream)), 2)
+
+    def test_history_offset_preserves_inclusive_end_boundary(self):
+        entity = SimpleNamespace(id=1, title='Channel', username='channel')
+        end = dt('2026-08-20') + timedelta(hours=23, minutes=59, seconds=59)
+        boundary = FakeMessage(1, '2026-08-20', 'boundary')
+        boundary.date = end
+        newer = FakeMessage(2, '2026-08-21', 'outside period')
+        class OffsetClient(FakeClient):
+            async def iter_messages(self, entity, reply_to=None, **kwargs):
+                async for row in super().iter_messages(entity, reply_to, **kwargs):
+                    if row.date < kwargs['offset_date']:
+                        yield row
+        client = OffsetClient({'channel': entity}, {1: [newer, boundary]})
+        with tempfile.TemporaryDirectory() as output:
+            result = asyncio.run(bot.process_channel(client, 'channel', dt('2026-08-20'), end, output_dir=output))
+        self.assertEqual([row['post_id'] for row in result['posts']], [1])
+        self.assertEqual(client.iter_options[0]['offset_date'], end + timedelta(seconds=1))
+
+    def test_export_client_paces_pages_shares_cooldown_and_latches_fatal(self):
+        async def scenario():
+            client = bot.ExportClient(None, 123, 'offline')
+            clock = SimpleNamespace(now=0.0)
+            loop = SimpleNamespace(time=lambda: clock.now)
+            async def sleep(delay):
+                clock.now += delay
+            page = bot.tl_functions.messages.GetHistoryRequest(None, 0, None, 0, 100, 0, 0, 0)
+            replies = bot.tl_functions.messages.GetRepliesRequest(None, 1, 0, None, 0, 100, 0, 0, 0)
+            media = bot.tl_functions.upload.GetFileRequest(None, 0, 4096)
+            times = []
+            async def rpc(*args, **kwargs):
+                times.append(clock.now)
+                return 'ok'
+            with patch.object(bot.asyncio, 'get_running_loop', return_value=loop), \
+                 patch.object(bot.asyncio, 'sleep', side_effect=sleep), \
+                 patch.object(bot.TelegramClient, '_call', side_effect=rpc) as call:
+                await client._call(None, page)
+                await client._call(None, replies)
+                await client._call(None, page)
+                await client._call(None, media)
+                self.assertEqual(times, [0, 1, 2, 2])
+                self.assertEqual(call.call_args.kwargs['flood_sleep_threshold'], 0)
+                call.side_effect = [FloodWaitError(4), 'ok']
+                await client._call(None, replies)
+                self.assertEqual(clock.now, 7)
+                self.assertEqual(client._page_interval, 2)
+                # Every RPC, including downloads, honors a wait raised by another worker.
+                client._resume_at = 12
+                call.side_effect = rpc
+                await client._call(None, media)
+                self.assertEqual(times[-1], 12)
+                call.side_effect = FloodWaitError(120)
+                with self.assertRaises(bot.RunFatalError):
+                    await client._call(None, page)
+                count = call.call_count
+                with self.assertRaises(bot.RunFatalError):
+                    await client._call(None, media)
+                self.assertEqual(call.call_count, count)
+                client._export_fatal = None
+                call.side_effect = FloodWaitError(1)
+                with self.assertRaises(bot.RunFatalError):
+                    await client._call(None, replies)
+                self.assertEqual(call.call_count, count + 4)
+            self.assertEqual(client.flood_sleep_threshold, 0)
+            self.assertTrue(client._no_updates)
+        asyncio.run(scenario())
+
     def test_day_first_dates_and_media_prompt(self):
         for value in ('21-08-2026', '21.08.2026', '21/08/2026'):
             self.assertEqual(bot.parse_date_value(value), dt('2026-08-21'))
@@ -287,7 +715,7 @@ class TelegramExportTests(unittest.TestCase):
         async def scenario(output):
             entity = SimpleNamespace(id=1, title='Channel', username='channel')
             class FatalClient(FakeClient):
-                async def iter_messages(self, entity, reply_to=None):
+                async def iter_messages(self, entity, reply_to=None, **kwargs):
                     self.iter_calls.append((entity.id, reply_to))
                     yield FakeMessage(1, '2026-08-20', 'text', media=SimpleNamespace(kind='video', id=11))
                     await asyncio.Event().wait()
@@ -528,9 +956,13 @@ class TelegramExportTests(unittest.TestCase):
 
         def capture(folder, channel_row, posts, comment_records=(), **kwargs):
             captured["is_list"] = isinstance(comment_records, list)
-            captured["first"] = next(comment_records)
-            return kwargs.get("export_id", "captured")
+            first = next(comment_records, None)
+            if first is not None:
+                captured["first"] = first
+            return original(folder, channel_row, posts, (() if first is None else
+                chain([first], comment_records)), **kwargs)
 
+        original = bot.publish_export
         with tempfile.TemporaryDirectory() as output:
             with patch.object(bot, "publish_export", side_effect=capture):
                 asyncio.run(bot.process_channel(client, "channel", dt("2026-08-20"), dt("2026-08-20"), comments_requested=True, output_dir=output))

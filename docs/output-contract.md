@@ -32,22 +32,31 @@ Telegram channel ID.
 CSV readers return values as strings. Convert IDs to one type before joining.
 Use arbitrary-precision integers or strings for Telegram IDs, not floating point.
 
-## Early text and final media snapshots
+## Early posts and final comment/media snapshots
 
-The producer collects posts and requested comments concurrently with at most
-three media download workers on one client. Comments are spooled to disk;
+The producer collects posts first, with at most three media download workers
+on one client. The first snapshot is published before any comment request.
+Then at most two comment workers collect independent threads while media
+continues downloading. Comments are spooled to disk;
 download jobs do not retain comment text or media bytes. Pending job metadata
 still scales with the number of attachments.
 
-After collection, revision 1 exposes all collected text and metadata, even when
-media is unfinished. Pending rows have empty `media_local_path`; completed worker
-results are applied only in the final publication, not by rewriting files per item.
-When downloads were queued, revision 2 adds actual paths and final statuses.
-When no files are queued, revision 1 is already the final snapshot.
+After post collection, revision 1 exposes all posts and metadata, even when
+comments and media are unfinished. Comment threads awaiting collection have
+`comments_export_status=pending` and `comments_exported=0`; `comments.jsonl`
+contains only its run-control record. Pending media rows have empty `media_local_path`;
+completed worker results are applied only in the final publication, not by rewriting files per item.
+When comments or downloads were queued, revision 2 adds collected comments,
+actual media paths and final statuses. Otherwise revision 1 is already final.
+Cancellation after revision 1 preserves all posts and publishes the comments
+already collected where possible: unfinished threads become `partial` when
+records exist, or `interrupted` when none were collected. This includes Cmd+C
+when running with `asyncio.run`. A forced kill leaves revision 1 available;
+it does not guarantee that comments in the temporary spool were published.
 
 `channel.csv.media_export_status` means:
 
-- `not_requested`: mode N; metadata only;
+- `not_requested`: mode N; media metadata only (comments can still be pending);
 - `downloading`: text snapshot published, final media outcome unconfirmed;
 - `complete`: every selected downloadable attachment succeeded, or none qualified;
 - `partial`: at least one ordinary attachment failure;
@@ -56,7 +65,7 @@ When no files are queued, revision 1 is already the final snapshot.
 `downloading` does not prove the process is still running. A killed process may
 leave its text snapshot available with that status.
 
-Before updating revision 1, the exporter preserves a verified copy in
+Before starting comment workers or updating revision 1, the exporter preserves a verified copy in
 `.text-ready-<export_id>/` using hard links (copies on filesystems without hard
 link support). Failure to create that copy leaves the root text snapshot intact.
 A failed final update restores the root where possible; the preserved copy
@@ -67,6 +76,36 @@ successful final publication, retry the root. A successful update removes it.
 This preserves the usable text snapshot, without claiming a directory-wide
 atomic transaction. Initial publication still uses the existing per-file atomic
 replacement and detection of mixed generations.
+
+## Resuming comments
+
+Choose mode 2 at startup or use `--resume-comments <channel-folder>`. This mode
+reads a verified local snapshot, resolves its channel, and checks the channel ID
+before updating anything. Finish or interrupt the previous writer before using
+resume on the same folder. It never reads post history, refreshes channel metadata,
+reorders posts, or downloads media. Existing text, entities, media paths and media
+statuses remain available. Newly retrieved comments retain media metadata only.
+
+Saved comment records are copied lazily to the working spool. IDs are deduplicated
+within each source post, and exported counts are recalculated from those records.
+Complete threads with matching saved counts are skipped. Pending, interrupted,
+failed, partial and previously unrequested threads with advertised replies are
+eligible for collection. A partial thread resumes with `offset_id` equal to its
+smallest saved comment ID: Telethon's default descending iterator fetches older
+replies. New records are also deduplicated against saved IDs.
+
+Each update uses a fresh `export_id` shared across all three files. Before the
+first resumed publication, the entire previous verified snapshot is preserved
+in `.text-ready-<new-export_id>/`. Publication failure restores that snapshot
+where possible, retaining the fallback if needed. Interrupted resumed runs use
+the same cancellation/partial-comment publication behavior as fresh runs.
+
+This continues the saved snapshot, rather than synchronizing a live channel.
+New posts, edits, new replies above a saved cursor and new replies in skipped
+complete threads are not refreshed. Use a new export to obtain a current snapshot.
+Resume starts from the last published records: Cmd+C publishes collected progress
+where possible; a forced kill can lose unpublished comments in the temporary spool.
+Mixed generations or corrupt files are refused without merging them.
 
 ## Schemas
 
@@ -114,9 +153,11 @@ before assuming that no records means no comments:
 - `not_requested` — comment export was disabled for the run;
 - `disabled` — the post has no discussion replies;
 - `unavailable` — replies were advertised but the discussion is unavailable;
+- `pending` — thread collection has not finished in the first snapshot;
 - `complete` — the retrieved count matches Telegram's count;
 - `partial` or `failed` — retain the records that exist, but do not treat them
   as a complete thread.
+- `interrupted` — collection stopped before any records were exported for the thread.
 
 For a media-bearing record, inspect `media_status` as well as
 `media_local_path`. Protected media is never downloaded; a failed download
@@ -133,6 +174,21 @@ key and Telegram media ID; an unavailable media ID uses `export_id` instead.
 The same attachment can be reused on repeat runs, while replaced media gets a
 different path. Unreferenced older files are retained, but are not part of the
 current dataset.
+
+## Request pacing
+
+The CLI uses `ExportClient` on the pinned Telethon 1.43.2 `_call` seam. History
+and reply page requests share a start interval of at least one second, including
+initial requests for different threads. Telethon retrieves up to 100 messages
+per page; individual messages are not delayed. Post iteration starts just after
+the inclusive end date to avoid reading newer history outside the selected range.
+
+Short FloodWait responses (at most 60 seconds) pause all new RPC calls, including
+media, and double the page interval up to five seconds. A wait over 60 seconds
+or a fourth consecutive wait in one call stops the client and batch. Requests
+already in flight cannot be recalled. Updates are disabled on this read-only
+client. This reduces risk; Telegram does not provide a guaranteed safe rate.
+Python callers using their own client retain its pacing and retry policy.
 
 ## Albums, captions and HTML reconstruction
 

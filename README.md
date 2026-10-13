@@ -26,6 +26,22 @@ Then run:
 python3 telegram_stats_bot.py
 ```
 
+At startup choose `1` (or Enter) for a new export, or `2` to add unfinished
+comments to an existing channel folder. Mode 2 asks only for the saved folder;
+it uses the saved posts and skips completed threads without downloading media.
+You can also start that mode directly:
+
+```bash
+python3 telegram_stats_bot.py --resume-comments output/shcherbaks
+```
+
+After Cmd+C, use this mode again: partially collected threads continue from
+their saved comment IDs, and saved comments are retained without duplicates.
+Finish or interrupt the previous export before resuming into the same folder.
+Existing post text, sorting and downloaded media remain available. This resumes
+the saved snapshot; it does not fetch new posts or new replies above an existing
+cursor/in completed threads. A new export is needed to refresh the channel.
+
 `API_ID`, `API_HASH`, and `PHONE` are read only at runtime, so importing the
 module and running its fake-client tests does not require secrets. `OUTPUT_DIR`
 is optional and defaults to `output`.
@@ -63,8 +79,8 @@ The choice applies to posts and exported comments. Protected attachments are
 never downloaded. One set of settings applies to the full
 batch; duplicate aliases are resolved once per Telegram channel ID.
 
-The CLI prints a live per-channel post counter and a final success/failure
-summary. Permanent errors for one channel do not prevent later channels from
+The CLI prints separate live counts for posts, comments, completed threads and
+media, and a final success/failure summary. Permanent errors for one channel do not prevent later channels from
 running. A long flood wait or disk-full error stops the batch before another
 Telegram request.
 
@@ -82,20 +98,28 @@ output/
     └── media/                 # only when files were downloaded
 ```
 
-One task collects records while up to three media downloads run concurrently
-on the same Telegram client. Once posts and requested comments are collected,
-the CLI prints `Тексты готовы: <folder>`: the three data files and `AGENTS.md`
-are readable while media continues downloading. Final publication updates paths
-and statuses once all downloads finish. A failed attachment keeps its text and
-metadata. There are no new dependencies or background services.
+Posts are collected first while up to three media downloads run concurrently
+on the same Telegram client. The CLI prints `Посты готовы: <folder>`: all posts,
+channel information and `AGENTS.md` are readable immediately. Requested comments
+then load in up to two separate tasks, while media continues downloading.
+Final publication adds comments, paths and statuses once collection and downloads
+finish. Cmd+C after `Посты готовы` preserves posts and saves comments already
+collected where possible, marking unfinished threads explicitly. A failed
+attachment keeps its text and metadata. There are no new dependencies or background services.
 
 The three data files form one snapshot only when both `export_id` and
 `export_revision` match. They are replaced atomically per file. Revision 1 is
-the first snapshot; revision 2 is the final update when media was queued.
+the first snapshot; revision 2 is the final update when comments or media were queued.
 Before that update the exporter preserves revision 1 in a temporary
 `.text-ready-<export_id>/` directory, removed after successful verification.
 If the update fails, it restores revision 1 where possible; otherwise the
 preserved directory remains readable. `AGENTS.md` explains this fallback.
+
+History and reply pages share a limit of one request start per second; messages
+inside a page are processed without a per-message delay. Short FloodWait responses
+pause all new requests and reduce the rate. A wait over 60 seconds stops the run.
+This reduces flood risk but cannot guarantee its absence. Network reconnection
+timeouts can still slow an export independently of comments.
 
 Pass the channel folder to an agent to analyze it or build HTML articles.
 Album IDs, explicit attachment order, raw captions and text entities preserve
