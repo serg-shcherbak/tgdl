@@ -26,8 +26,10 @@ Then run:
 python3 telegram_stats_bot.py
 ```
 
-At startup choose `1` (or Enter) for a new export, or `2` to add unfinished
-comments to an existing channel folder. Mode 2 asks only for the saved folder;
+At startup choose `1` (or Enter) for a new export in a separate folder. Previous
+exports, including their media and any user files, are left unchanged. A narrow
+date range or an empty result never replaces an older dataset. Choose `2` to add
+unfinished comments to an existing channel folder. Mode 2 asks only for the saved folder;
 it uses the saved posts and skips completed threads without downloading media.
 You can also start that mode directly:
 
@@ -37,7 +39,13 @@ python3 telegram_stats_bot.py --resume-comments output/shcherbaks
 
 After Cmd+C, use this mode again: partially collected threads continue from
 their saved comment IDs, and saved comments are retained without duplicates.
-Finish or interrupt the previous export before resuming into the same folder.
+Every active exporter holds an exclusive OS writer lock for its dataset folder.
+A second resume is refused before reading that snapshot or requesting Telegram
+data. The lock is released after completion, cancellation or process exit.
+The `.export.lock` file remains on disk; its existence does not mean the folder
+is busy. Do not delete it to bypass an active writer.
+Use the exact folder path printed for the intended export, including its
+timestamp suffix when present.
 Existing post text, sorting and downloaded media remain available. This resumes
 the saved snapshot; it does not fetch new posts or new replies above an existing
 cursor/in completed threads. A new export is needed to refresh the channel.
@@ -56,7 +64,8 @@ python3 -m unittest -v
 
 At `Канал(ы):`, provide any of the following:
 
-- one `@channel`, channel name, or `https://t.me/channel` URL;
+- one `@channel`, channel name, `t.me/channel` or `https://t.me/channel` URL
+  (post links and `t.me/s/channel` previews also select the channel);
 - several names or URLs separated by spaces or commas;
 - a quoted path to a UTF-8 text file with one channel per line.
 
@@ -75,12 +84,26 @@ Choose media with one letter (case-insensitive):
 | `A` | All downloadable attachments, including audio, documents, animations and stickers |
 
 GIF/animations and stickers belong to `A`, even when stored as video/image files.
+Poll questions, answers and available results are exported as text in every mode,
+including `N`, without a separate option. Read `text` together with `poll_text` in
+the same post or comment record. Original text and its formatting remain intact.
+Missing poll results are unknown, not zero. Locations (including live locations
+and venues) are excluded; the message row and its original text remain.
+Contacts, link previews, dice and giveaways retain their available metadata.
+Stories and paid media retain references/metadata; their nested files are not
+downloaded by this exporter.
 The choice applies to posts and exported comments. Protected attachments are
 never downloaded. One set of settings applies to the full
 batch; duplicate aliases are resolved once per Telegram channel ID.
 
 The CLI prints separate live counts for posts, comments, completed threads and
-media, and a final success/failure summary. Permanent errors for one channel do not prevent later channels from
+media, and a final summary with each saved folder's path. Empty periods and
+incomplete comments/media receive explicit warnings. A saved dataset can be
+partial; inspect its status fields. The exit code still reports channel-level
+failures, not attachment failures or incomplete threads.
+Comment counts can grow during export: a normally finished thread is complete
+when exported records meet or exceed Telegram's initial advertised count.
+Permanent errors for one channel do not prevent later channels from
 running. A long flood wait or disk-full error stops the batch before another
 Telegram request.
 
@@ -95,13 +118,33 @@ output/
     ├── posts.csv
     ├── comments.jsonl
     ├── AGENTS.md              # self-contained guide for an agent using this folder
+    ├── .export.lock           # persistent file; OS lock is held only by a writer
     └── media/                 # only when files were downloaded
 ```
+
+If that channel folder already exists, a new export uses
+`<name>__<UTC timestamp>_<random suffix>/`, for example
+`shcherbaks__20261015T072125Z_a1b2c3d4/`. Folder creation reserves a unique name,
+including when the previous folder is still empty or contains only `.export.lock`.
+A base folder with other contents owned
+by a different or unknown channel is refused without changing its contents.
+`output/shcherbaks` remains the original export; it does not point to the latest
+run. Consumers must use the returned or printed folder path. Each new export
+downloads its own media files, so repeated exports need additional disk space.
 
 Posts are collected first while up to three media downloads run concurrently
 on the same Telegram client. The CLI prints `Посты готовы: <folder>`: all posts,
 channel information and `AGENTS.md` are readable immediately. Requested comments
 then load in up to two separate tasks, while media continues downloading.
+Cmd+C before `Посты готовы` also publishes the posts already collected, retaining
+completed media and marking unfinished work. `posts_export_status=interrupted`
+in `channel.csv` and the run-control record means the requested post history is
+incomplete. The CLI prints the saved folder and count. Mode 2 can add comments
+to those saved posts, but does not fetch missing posts: use mode 1 for a complete
+period. Older datasets without this field are treated as complete histories.
+If the disk is full or unwritable, saving progress can fail explicitly; earlier
+datasets remain intact. A forced kill or power loss cannot save unpublished
+in-memory posts before the first publication.
 Final publication adds comments, paths and statuses once collection and downloads
 finish. Cmd+C after `Посты готовы` preserves posts and saves comments already
 collected where possible, marking unfinished threads explicitly. A failed
@@ -144,3 +187,6 @@ The test suite validates parsing, output schemas, generation integrity, comments
 media handling, folder collisions, flood waits, disk-full cleanup, batch
 isolation, and console progress with fake Telegram clients. It does not replace
 an authenticated live Telegram smoke test.
+
+See [the UX safety review](docs/ux-safety-review.md) for the data-loss regression
+and remaining risks.

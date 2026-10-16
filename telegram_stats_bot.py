@@ -40,6 +40,7 @@ CHANNEL_COLUMNS = (
     'subscriber_count', 'channel_type', 'broadcast', 'megagroup',
     'gigagroup', 'verified', 'restricted', 'scam', 'fake', 'creation_time',
     'linked_discussion_id', 'period_start', 'period_end', 'export_time',
+    'posts_export_status',
 )
 POST_COLUMNS = (
     'export_id', 'export_revision', 'channel_id', 'post_id', 'message_id', 'date', 'text',
@@ -48,6 +49,7 @@ POST_COLUMNS = (
     'comments_exported', 'comments_available', 'comments_export_status',
     'discussion_id', 'media_type', 'media_mime_type', 'media_size',
     'media_name', 'media_local_path', 'media_status', 'media_extra_json',
+    'poll_text',
 )
 
 
@@ -99,10 +101,10 @@ def load_runtime_config(env: Optional[Mapping[str, str]] = None) -> RuntimeConfi
 
 def parse_channel_input(raw: str) -> str:
     raw = raw.strip()
-    if re.fullmatch(r'https?://t\.me/(?:joinchat/|\+)[\w-]+/?', raw):
-        return raw
-    m = re.fullmatch(r'https?://t\.me/([\w]+?)/?', raw)
-    if m:
+    if re.fullmatch(r'(?:https?://)?t\.me/(?:joinchat/|\+)[\w-]+/?', raw, re.IGNORECASE):
+        return raw if re.match(r'https?://', raw, re.IGNORECASE) else f'https://{raw}'
+    m = re.fullmatch(r'(?:https?://)?t\.me/(?:s/)?([a-zA-Z0-9_]+)(?:/\d+)?/?', raw, re.IGNORECASE)
+    if m and m.group(1).lower() not in {'c', 's', 'joinchat'}:
         return m.group(1)
     return raw.lstrip('@')
 
@@ -147,7 +149,7 @@ def parse_channel_source(raw: str) -> List[str]:
 
 
 def _looks_like_path(value: str) -> bool:
-    if re.search(r'(?:^|[\s,])https?://', value, re.IGNORECASE):
+    if re.search(r'(?:^|[\s,])(?:https?://|t\.me/)', value, re.IGNORECASE):
         return False
     if os.path.sep in value or (os.path.altsep and os.path.altsep in value):
         return True
@@ -240,7 +242,7 @@ def ask_start_date() -> datetime:
 def ask_end_date() -> datetime:
     today = datetime.now(timezone.utc).strftime('%d-%m-%Y')
     while True:
-        raw = input(f"Дата конца   [Enter = сегодня {today}]: ").strip()
+        raw = input(f"Дата конца   [Enter = сегодня по UTC, {today}]: ").strip()
         if not raw:
             return datetime.now(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=999999)
         try:
@@ -250,7 +252,8 @@ def ask_end_date() -> datetime:
 
 
 def ask_dates() -> Tuple[datetime, datetime]:
-    print("\n📅 Укажите диапазон дат (ДД-ММ-ГГГГ, ДД.ММ.ГГГГ или ДД/ММ/ГГГГ)\n")
+    print("\n📅 Укажите диапазон дат (ДД-ММ-ГГГГ, ДД.ММ.ГГГГ или ДД/ММ/ГГГГ)")
+    print("Даты включительно, границы суток — UTC.\n")
     while True:
         start = ask_start_date()
         end = ask_end_date()
@@ -302,7 +305,7 @@ def _channel_id_from_csv(folder: str) -> str:
 
 
 def select_channel_folder(output_dir: str, entity: Any) -> str:
-    """Create or validate the safe folder owned by the resolved channel."""
+    """Reserve a new folder without replacing any existing channel dataset."""
     root = os.path.realpath(os.path.abspath(os.fspath(output_dir)))
     name = channel_folder_name(entity)
     folder = os.path.realpath(os.path.join(root, name))
@@ -313,13 +316,15 @@ def select_channel_folder(output_dir: str, entity: Any) -> str:
     if not inside:
         raise ChannelFolderError("resolved channel folder escapes OUTPUT_DIR")
     os.makedirs(root, exist_ok=True)
-    if os.path.exists(folder) and not os.path.isdir(folder):
-        raise ChannelFolderError(f"channel folder is not a directory: {folder}")
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+    try:
+        os.mkdir(folder)
         return folder
+    except FileExistsError:
+        pass
+    if not os.path.isdir(folder):
+        raise ChannelFolderError(f"channel folder is not a directory: {folder}")
 
-    if os.listdir(folder):
+    if set(os.listdir(folder)) - {'.export.lock'}:
         try:
             owner_id = _channel_id_from_csv(folder)
         except ChannelFolderError:
@@ -329,7 +334,28 @@ def select_channel_folder(output_dir: str, entity: Any) -> str:
             raise ChannelFolderError(
                 f"channel folder belongs to channel_id {owner_id}, not {channel_id}"
             )
-    return folder
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    return tempfile.mkdtemp(prefix=f'{name}__{stamp}_', dir=root)
+
+
+def _lock_export_folder(folder: str):
+    """Return an open OS-locked file; closing it releases the writer lock."""
+    # Keep the lock file: unlinking it would let writers lock different inodes.
+    lock = open(os.path.join(folder, '.export.lock'), 'a+b')
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException as exc:
+        lock.close()
+        if isinstance(exc, OSError) and exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+            raise ChannelFolderError(f'Папка занята другой выгрузкой: {folder}. Дождитесь ее завершения.') from exc
+        raise
+    return lock
 
 
 def _make_temp(folder: str, filename: str) -> str:
@@ -367,6 +393,7 @@ def _write_comments_temp(folder: str, control: Mapping[str, Any], records: Itera
                     continue
                 value['export_id'] = control['export_id']
                 value['export_revision'] = control['export_revision']
+                value.setdefault('poll_text', '')
                 stream.write(json.dumps(value, ensure_ascii=False, separators=(',', ':')) + '\n')
     except Exception:
         try:
@@ -388,6 +415,7 @@ def _load_saved_export(folder: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]
     assert_generation_consistent(folder)
     with open(os.path.join(folder, 'channel.csv'), encoding='utf-8', newline='') as stream:
         channel = next(csv.DictReader(stream))
+    channel['posts_export_status'] = channel.get('posts_export_status') or 'complete'
     channel['channel_id'] = int(channel['channel_id'])
     if channel['channel_id'] <= 0:
         raise ValueError('invalid saved channel ID')
@@ -415,20 +443,22 @@ def _load_saved_export(folder: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]
         post.setdefault('text_entities_json', '[]')
         post.setdefault('media_status', 'metadata_only' if post.get('media_type') else 'none')
         post.setdefault('media_local_path', '')
+        post.setdefault('poll_text', '')
     return channel, posts
 
 
 async def resume_comments(client: Any, folder: str) -> Dict[str, Any]:
     """Add unfinished comment threads to a verified local post snapshot."""
     folder = os.path.realpath(os.path.abspath(os.fspath(folder)))
-    channel, posts = _load_saved_export(folder)
-    source = channel.get('username') or tl_types.PeerChannel(channel['channel_id'])
-    entity = await client.get_entity(source)
-    if getattr(entity, 'id', None) != channel['channel_id']:
-        raise ChannelFolderError('resolved Telegram channel does not own this saved export')
-    start, end = parse_date_range(channel['period_start'], channel['period_end'])
-    return await process_channel(client, str(source), start, end, comments_requested=True,
-                                 resolved_entity=entity, _saved_export=(folder, channel, posts))
+    with _lock_export_folder(folder):
+        channel, posts = _load_saved_export(folder)
+        source = channel.get('username') or tl_types.PeerChannel(channel['channel_id'])
+        entity = await client.get_entity(source)
+        if getattr(entity, 'id', None) != channel['channel_id']:
+            raise ChannelFolderError('resolved Telegram channel does not own this saved export')
+        start, end = parse_date_range(channel['period_start'], channel['period_end'])
+        return await process_channel(client, str(source), start, end, comments_requested=True,
+                                     resolved_entity=entity, _saved_export=(folder, channel, posts))
 
 
 def publish_export(
@@ -452,6 +482,7 @@ def publish_export(
     channel = dict(channel_row)
     channel['export_id'] = export_id
     channel['export_revision'] = export_revision
+    channel.setdefault('posts_export_status', 'complete')
     channel_id = channel.get('channel_id', '')
     posts = []
     for source in post_rows:
@@ -476,6 +507,7 @@ def publish_export(
             bool(channel.get('comments_requested'))
             if comments_requested is None else bool(comments_requested)
         ),
+        'posts_export_status': channel['posts_export_status'],
         'export_time': channel.get('export_time', ''),
     }
     temporary = []
@@ -626,6 +658,7 @@ def _media_metadata(message: Any) -> Tuple[Dict[str, Any], bool]:
     empty = {
         'media_type': '', 'media_mime_type': '', 'media_size': '',
         'media_name': '', 'media_extra_json': '', 'media_status': 'none',
+        'poll_text': '',
     }
     if not media:
         return empty, False
@@ -643,7 +676,7 @@ def _media_metadata(message: Any) -> Tuple[Dict[str, Any], bool]:
         except Exception:
             parsed = {}
             parsed_obj = None
-    media_type = getattr(media, 'kind', None) or parsed.get('type')
+    media_type = parsed.get('type')
     class_name = type(media).__name__
     if not media_type:
         media_type = {
@@ -652,6 +685,8 @@ def _media_metadata(message: Any) -> Tuple[Dict[str, Any], bool]:
             'MessageMediaWebPage': 'web_page',
             'MessageMediaPoll': 'poll',
             'MessageMediaGeo': 'location',
+            'MessageMediaGeoLive': 'location',
+            'MessageMediaVenue': 'location',
             'MessageMediaContact': 'contact',
         }.get(class_name, class_name)
     mime_type = parsed.get('mime_type') or getattr(file_obj, 'mime_type', None) or getattr(media, 'mime_type', None)
@@ -659,7 +694,7 @@ def _media_metadata(message: Any) -> Tuple[Dict[str, Any], bool]:
     name = parsed.get('file_name') or getattr(file_obj, 'name', None) or getattr(media, 'file_name', None)
     extra = {
         key: value for key, value in parsed.items()
-        if key not in {'type', 'mime_type', 'file_size', 'file_name'} and value is not None
+        if key not in {'type', 'mime_type', 'file_size', 'file_name', 'poll_text'} and value is not None
     }
     extra.setdefault('source_type', class_name)
     for key in ('width', 'height', 'duration', 'supports_streaming'):
@@ -673,10 +708,9 @@ def _media_metadata(message: Any) -> Tuple[Dict[str, Any], bool]:
         'media_name': _value_or_empty(name),
         'media_extra_json': json.dumps(extra, ensure_ascii=False, separators=(',', ':'), default=str),
         'media_status': 'metadata_only',
+        'poll_text': parsed.get('poll_text', ''),
     }
-    downloadable = bool(parsed_obj) or bool(file_obj) or hasattr(media, 'kind') or class_name in {
-        'MessageMediaPhoto', 'MessageMediaDocument'
-    }
+    downloadable = isinstance(parsed_obj, (tl_types.Photo, tl_types.Document))
     return info, downloadable
 
 
@@ -689,6 +723,9 @@ def _media_suffix(info: Mapping[str, Any]) -> str:
     return {
         'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
         'video/mp4': '.mp4', 'audio/mpeg': '.mp3',
+        'audio/ogg': '.ogg', 'image/webp': '.webp', 'video/webm': '.webm',
+        'application/x-tgsticker': '.tgs', 'video/quicktime': '.mov',
+        'audio/mp4': '.m4a', 'audio/wav': '.wav',
     }.get(str(info.get('media_mime_type') or ''), '.bin')
 
 
@@ -854,12 +891,16 @@ comments.jsonl: первая запись run_control, остальные commen
 media_export_status: not_requested — файлы не запрошены; downloading — итог еще не подтвержден;
 complete — все выбранные файлы готовы; partial — есть ошибки; interrupted — запуск прерван.
 downloading не доказывает, что процесс продолжает работать. Данные текста уже пригодны для чтения.
+posts_export_status: complete — чтение истории за период завершено; interrupted — сохранена только прочитанная часть.
+В старых выгрузках без posts_export_status история считается complete.
+Догрузка комментариев не дочитывает прерванную историю постов; для полного периода нужна новая выгрузка.
 
 ## Связи, альбомы и HTML
 
 Ключ поста: (channel_id, post_id). message_id — исходное сообщение Telegram.
 Комментарии присоединяй по (channel_id, source_post_id); их ключ включает discussion_chat_id и comment_id.
 reply_to_comment_id/reply_to_top_id сохраняют связи ответов; корневое сообщение обсуждения не является комментарием.
+discussion_thread_root_id — ID корня в группе обсуждения; это не ID поста канала. Пустое значение означает неизвестный корень.
 grouped_id объединяет сообщения альбома: для постов ключ (channel_id, grouped_id),
 для комментариев — (discussion_chat_id, grouped_id). Пустой grouped_id означает самостоятельное сообщение.
 При HTML-верстке альбом делай одной статьей, вложения сортируй по media_order (начиная с 1).
@@ -868,6 +909,9 @@ grouped_id объединяет сообщения альбома: для пос
 Выгрузка описывает только доступные сообщения в выбранном периоде: альбом может быть неполным.
 Не суммируй просмотры элементов альбома как независимые просмотры одной статьи.
 text — точный исходный текст; text_entities_json — JSON-строка со списком сущностей форматирования Telegram.
+poll_text — читаемый вопрос, варианты и доступные итоги опроса. Читай text и poll_text как содержимое одного поста.
+Опросы экспортируются при любом выборе файлов, включая N. В старых данных без poll_text поле считается пустым.
+Структура опроса и сущности вопроса/ответов находятся в media_extra_json.poll; неизвестные результаты не являются нулем.
 В сущностях _ задает тип, offset/length считаются в единицах UTF-16, url содержит адрес скрытой ссылки.
 Сохраняй ссылки, выделения и переносы строк. Экранируй текст и HTML-атрибуты, не исполняй исходный HTML и опасные URL-схемы.
 Идентификаторы могут быть большими числами: не преобразуй их в числа с плавающей точкой.
@@ -881,9 +925,12 @@ protected — защищено от скачивания; download_failed — о
 Невключенные в текущие записи старые файлы в media/ не являются частью этой выгрузки.
 Для отсутствующего файла оставь понятную заглушку с известным типом; не создавай фиктивную ссылку.
 media_extra_json — JSON-строка с расширенными атрибутами. Фото, видео, аудио и документы различаются по media_type/MIME.
+Опросы, контакты, превью ссылок, кубики и розыгрыши не требуют файла. Локации исключены, исходный текст сообщения сохранен.
+Для story/paid_media сохранены доступные сведения; это не подтверждение скачивания вложенных файлов.
 comments_count — счетчик Telegram; comments_exported — реально записанные комментарии.
 Посты публикуются до чтения комментариев; pending означает, что ветка еще ожидает выгрузки.
 comments_export_status различает not_requested, disabled, unavailable, pending, complete, partial, failed и interrupted.
+complete означает нормальное завершение обхода и число записей не меньше исходного счетчика; счетчик Telegram может отстать.
 Нулевое число записей не всегда означает отсутствие комментариев. Не выдавай pending/partial/failed/interrupted за полную ветку.
 Догрузка комментариев продолжает сохраненный срез: готовые ветки пропускаются, незавершенные читаются ниже сохраненного ID.
 Новые посты, правки и новые ответы выше сохраненного ID при догрузке не обновляются; для актуального среза нужна новая выгрузка.
@@ -956,7 +1003,7 @@ def _comment_row(
         'source_post_id': source_post_id,
         'discussion_chat_id': _value_or_empty(discussion_id),
         'comment_id': _value_or_empty(getattr(comment, 'id', None)),
-        'discussion_thread_root_id': _value_or_empty(getattr(reply_to, 'reply_to_top_id', None) or source_post_id),
+        'discussion_thread_root_id': _value_or_empty(getattr(reply_to, 'reply_to_top_id', None) or getattr(reply_to, 'reply_to_msg_id', None)),
         'sender_id': _value_or_empty(getattr(comment, 'sender_id', None) or getattr(sender, 'id', None)),
         'sender_username': _value_or_empty(getattr(sender, 'username', None)),
         'reply_to_comment_id': _value_or_empty(getattr(reply_to, 'reply_to_msg_id', None)),
@@ -970,6 +1017,7 @@ def _comment_row(
         'media_local_path': media_local_path,
         'media_status': media.get('media_status', ''),
         'media_extra_json': media.get('media_extra_json', ''),
+        'poll_text': media.get('poll_text', ''),
     }
 
 
@@ -996,12 +1044,16 @@ async def process_channel(
         raise ValueError('media_mode must be N, P, V, or A')
     entity = resolved_entity if resolved_entity is not None else await client.get_entity(channel)
     folder = _saved_export[0] if _saved_export else select_channel_folder(output_dir, entity)
+    if not _saved_export:
+        print(f'\nНовая выгрузка: {folder}', flush=True)
     export_id = uuid.uuid4().hex
     created_media = set()
     comment_spool_path = None
     comment_spool = None
     progress_started = False
     text_published = False
+    channel_row = None
+    write_lock = None
     snapshot = None
     producer = None
     workers = []
@@ -1053,9 +1105,11 @@ async def process_channel(
         nonlocal jobs
         if not getattr(message, 'media', None):
             return
-        if getattr(message, 'noforwards', False) or getattr(entity, 'noforwards', False):
+        if not downloadable:
+            row['media_status'] = 'metadata_only'
+        elif getattr(message, 'noforwards', False) or getattr(entity, 'noforwards', False):
             row['media_status'] = 'protected'
-        elif media_mode == 'N' or not downloadable:
+        elif media_mode == 'N':
             row['media_status'] = 'metadata_only'
         elif not _media_selected(message, info, media_mode):
             row['media_status'] = 'skipped_by_filter'
@@ -1215,7 +1269,7 @@ async def process_channel(
                     await asyncio.sleep(0)
                     if fatal.done():
                         return
-                post['comments_export_status'] = ('complete' if post['comments_exported'] == post['comments_count'] else 'partial')
+                post['comments_export_status'] = ('complete' if post['comments_exported'] >= post['comments_count'] else 'partial')
             except Exception as exc:
                 if isinstance(exc, RunFatalError) or _is_long_flood_wait(exc, client) or _is_no_space(exc):
                     if not fatal.done():
@@ -1227,17 +1281,23 @@ async def process_channel(
             show_progress()
 
     try:
+        # resume_comments already holds this lock before loading _saved_export.
+        if not _saved_export:
+            write_lock = _lock_export_folder(folder)
         if comments_requested:
             comment_spool_path = _make_temp(folder, 'comments.spool.jsonl')
             comment_spool = open(comment_spool_path, 'w', encoding='utf-8', newline='')
         if _saved_export:
             channel_row, posts = _saved_export[1:]
+            saved_comments_state = [(post['comments_exported'], post['comments_export_status']) for post in posts]
+            resume_changed = False
             posts_by_id = {post['post_id']: post for post in posts}
             for post in posts:
                 post['comments_exported'] = 0
                 track_album(post, bool(post.get('media_order')))
             for row in _iter_comment_spool(os.path.join(folder, 'comments.jsonl')):
                 if row.get('record_type') == 'run_control':
+                    resume_changed |= row.get('comments_requested') is not True
                     continue
                 if row.get('record_type') != 'comment' or str(row.get('channel_id')) != str(channel_row['channel_id']):
                     raise ValueError('comment record does not belong to this channel')
@@ -1250,6 +1310,7 @@ async def process_channel(
                     raise ValueError('comment record does not belong to its saved post/thread')
                 key = (post_id, comment_id)
                 if key in seen_comments:
+                    resume_changed = True
                     continue
                 seen_comments.add(key)
                 row['grouped_id'] = int(row['grouped_id']) if row.get('grouped_id') else ''
@@ -1262,7 +1323,7 @@ async def process_channel(
                 status = post['comments_export_status']
                 if status in {'disabled', 'unavailable'}:
                     continue
-                if status == 'complete' and post['comments_exported'] == post['comments_count']:
+                if status == 'complete' and post['comments_exported'] >= post['comments_count']:
                     continue
                 if not post['comments_count']:
                     post['comments_export_status'] = 'complete' if post['comments_available'] else 'disabled'
@@ -1271,12 +1332,15 @@ async def process_channel(
                 else:
                     post['comments_export_status'] = 'pending'
                     pending_comments.append(post)
-            if not pending_comments:
+            resume_changed |= any((post['comments_exported'], post['comments_export_status']) != old
+                                  for post, old in zip(posts, saved_comments_state))
+            if not pending_comments and not resume_changed:
                 print('Комментарии к сохраненным постам уже выгружены.', flush=True)
                 return {'channel': channel_row, 'folder': folder, 'posts': posts, 'export_id': channel_row['export_id']}
         else:
             full = await _get_full_channel(client, entity)
             channel_row = _channel_row(entity, full, start_date, end_date)
+            channel_row['posts_export_status'] = 'interrupted'
         saved_media_status = channel_row.get('media_export_status', 'not_requested')
         channel_row.update(export_id=export_id, comments_requested=comments_requested)
         discussion_default = channel_row.get('linked_discussion_id') or None
@@ -1290,9 +1354,10 @@ async def process_channel(
         if not _saved_export:
             producer = asyncio.create_task(collect())
             await wait_or_fatal(producer)
+            channel_row['posts_export_status'] = 'complete'
         show_progress(force=True)
         if not _saved_export:
-            posts.sort(key=lambda row: (row.get(sort_key) or 0) if sort_key != 'date' else row['date'],
+            posts.sort(key=lambda row: (row.get(sort_key) or 0) if sort_key != 'date' else (row['date'], row['post_id']),
                        reverse=sort_key in {'forwards', 'reactions'})
         _write_export_agents(folder, export_id)
         if _saved_export:
@@ -1321,55 +1386,83 @@ async def process_channel(
             if _saved_export:
                 status = saved_media_status
             publish(2, status, True)
+        if snapshot:
             assert_generation_consistent(folder)
             shutil.rmtree(snapshot)
             snapshot = None
+        if jobs or pending_comments:
             print(f"\nЭкспорт завершен: постов {len(posts)}, комментов {comments_loaded}, медиа {len(media_results)}/{jobs}", flush=True)
         posts = [apply_results(row, True) for row in posts]
         return {'channel': channel_row, 'folder': folder, 'posts': posts, 'export_id': export_id}
-    except BaseException:
+    except BaseException as error:
+        save_error = None
         for task in [producer, *comment_workers, *workers, progress]:
             if task is not None:
                 task.cancel()
         await asyncio.gather(*(task for task in [producer, *comment_workers, *workers, progress] if task is not None), return_exceptions=True)
+        if not text_published and not _saved_export and channel_row is not None:
+            try:
+                posts.sort(key=lambda row: (row.get(sort_key) or 0) if sort_key != 'date' else (row['date'], row['post_id']),
+                           reverse=sort_key in {'forwards', 'reactions'})
+                _write_export_agents(folder, export_id)
+                publish(1, 'not_requested' if media_mode == 'N' else 'interrupted', True)
+                text_published = True
+                assert_generation_consistent(folder)
+                print(f'\nСохранен прогресс: {folder} — постов: {len(posts)}; '
+                      f"статус истории: {channel_row['posts_export_status']}", flush=True)
+            except Exception as exc:
+                if _is_no_space(exc):
+                    save_error = exc
+                print(f'\nНе удалось сохранить прогресс в {folder}: {exc}', file=sys.stderr, flush=True)
         if text_published and snapshot:
             try:
                 publish(2, saved_media_status if _saved_export else ('not_requested' if media_mode == 'N' else 'interrupted'), True)
                 assert_generation_consistent(folder)
                 shutil.rmtree(snapshot)
                 snapshot = None
-            except Exception:
+            except Exception as exc:
+                if _is_no_space(exc):
+                    save_error = exc
                 try:
                     _restore_text_snapshot(folder, snapshot)
-                except OSError:
+                except OSError as exc:
+                    if _is_no_space(exc):
+                        save_error = exc
                     pass  # The unchanged snapshot remains readable even if restoring the root fails.
         if not text_published:
             if snapshot:
                 try:
                     _restore_text_snapshot(folder, snapshot)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    if _is_no_space(exc):
+                        save_error = exc
             for path in created_media:
                 try:
                     os.unlink(path)
                 except FileNotFoundError:
                     pass
+        if save_error is not None and isinstance(error, Exception):
+            raise save_error from error
         raise
     finally:
-        fatal.cancel()
-        for task in [producer, *comment_workers, *workers, progress]:
-            if task is not None and not task.done():
-                task.cancel()
-        await asyncio.gather(*(task for task in [producer, *comment_workers, *workers, progress] if task is not None), return_exceptions=True)
-        if progress_started:
-            print()
-        if comment_spool is not None and not comment_spool.closed:
-            comment_spool.close()
-        if comment_spool_path:
-            try:
-                os.unlink(comment_spool_path)
-            except FileNotFoundError:
-                pass
+        try:
+            fatal.cancel()
+            for task in [producer, *comment_workers, *workers, progress]:
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(*(task for task in [producer, *comment_workers, *workers, progress] if task is not None), return_exceptions=True)
+            if progress_started:
+                print()
+            if comment_spool is not None and not comment_spool.closed:
+                comment_spool.close()
+            if comment_spool_path:
+                try:
+                    os.unlink(comment_spool_path)
+                except FileNotFoundError:
+                    pass
+        finally:
+            if write_lock is not None:
+                write_lock.close()
 
 
 def _normalise_channel_sources(channels: Any) -> List[str]:
@@ -1455,15 +1548,27 @@ def ask_channel_source() -> List[str]:
 
 
 def _print_export_summary(result: Mapping[str, Any]) -> None:
-    print(f"\n✅ Успешно: {len(result['successes'])}; ошибок: {len(result['failures'])}")
+    print(f"\n📁 Сохранено выгрузок: {len(result['successes'])}; ошибок каналов: {len(result['failures'])}")
     for item in result['successes']:
         title = item['channel'].get('title') or item['channel'].get('channel_id')
-        print(f"   • {title} — постов: {len(item.get('posts', []))}")
+        posts = item.get('posts', [])
+        print(f"   • {title} — постов: {len(posts)}")
+        print(f"     Папка: {item['folder']}")
+        if item['channel'].get('posts_export_status') == 'interrupted':
+            print('     ⚠️ История постов неполная: чтение прервано. Для полного периода нужна новая выгрузка.')
+        if not posts and item['channel'].get('posts_export_status') != 'interrupted':
+            print('     ⚠️ За выбранный период постов нет. Проверьте канал и даты (UTC).')
+        incomplete = sum(post.get('comments_export_status') in {'unavailable', 'pending', 'partial', 'failed', 'interrupted'}
+                         for post in posts)
+        if incomplete:
+            print(f'     ⚠️ Комментарии неполные: веток {incomplete}. Подробности в comments_export_status.')
+        if item['channel'].get('media_export_status') in {'partial', 'interrupted', 'downloading'}:
+            print('     ⚠️ Часть медиа не загружена. Подробности в media_status.')
     for item in result['failures']:
         print(f"   ❌ {item['channel']}: {item['error']}")
     if result.get('fatal_error'):
         print(f"⛔ Выполнение остановлено: {result['fatal_error']}")
-    if len(result['successes']) == 1:
+    if len(result['successes']) == 1 and result.get('sort_key'):
         posts = result['successes'][0].get('posts', [])
         sort_key = result.get('sort_key', 'date')
         sort_label = result.get('sort_label', 'по дате')
@@ -1474,7 +1579,8 @@ def _print_export_summary(result: Mapping[str, Any]) -> None:
         print(f"❤️  Всего реакций:   {sum((post.get('reactions') or 0) for post in posts)}")
         top_label = "последних" if sort_key == "date" else "топ"
         print(f"\n🔥 5 {top_label} постов ({sort_label}):")
-        for index, post in enumerate(posts[:5], 1):
+        top_posts = list(reversed(posts[-5:])) if sort_key == 'date' else posts[:5]
+        for index, post in enumerate(top_posts, 1):
             print(
                 f"  {index}. Пересылок: {post.get('forwards') or 0}, "
                 f"Реакций: {post.get('reactions') or 0}, "
@@ -1496,7 +1602,8 @@ async def main(argv=None):
 
     resume_folder = args.resume_comments
     if not resume_folder:
-        print('\n1 — новая выгрузка (Enter); 2 — догрузить комментарии к сохраненным постам')
+        print('\n1 — новая выгрузка в отдельную папку (Enter); 2 — догрузить комментарии к сохраненным постам')
+        print('Режим 1 сохраняет предыдущие выгрузки без изменений.')
         while True:
             operation = input('Режим [1/2]: ').strip() or '1'
             if operation in {'1', '2'}:
@@ -1509,10 +1616,19 @@ async def main(argv=None):
                 return 1
     if resume_folder:
         try:
-            _load_saved_export(resume_folder)
+            with _lock_export_folder(resume_folder):
+                saved_channel, saved_posts = _load_saved_export(resume_folder)
         except (OSError, ValueError, KeyError, TypeError, csv.Error) as exc:
             print(f'Не удалось прочитать выгрузку: {exc}')
             return 1
+        print(f'\nДогрузка комментариев в папку: {os.path.realpath(resume_folder)}')
+        print(f"Канал: {saved_channel.get('title') or saved_channel['channel_id']}; постов: {len(saved_posts)}; "
+              f"период UTC: {saved_channel.get('period_start', '')} — {saved_channel.get('period_end', '')}")
+        print('Папка будет заблокирована на время догрузки.')
+        if saved_channel['posts_export_status'] == 'interrupted':
+            print('История постов неполная. Догрузка комментариев не дочитывает посты; для полного периода нужен режим 1.')
+        print('Продолжается сохраненный срез: новые посты, правки и новые ответы в готовых ветках')
+        print('или выше сохраненного ID не обновляются. Для актуального среза выберите режим 1.')
     else:
         channels = ask_channel_source()
         settings = collect_run_settings()
@@ -1526,7 +1642,7 @@ async def main(argv=None):
             except Exception as exc:
                 print(f'Догрузка остановлена: {exc}')
                 return 1
-            print(f"Комментарии сохранены: {saved['folder']}")
+            _print_export_summary({'successes': [saved], 'failures': []})
             return 0
         result = await run_exports(
             client,

@@ -1,6 +1,6 @@
 # Export output contract
 
-The exporter creates one channel dataset per successful resolution:
+Each new export reserves a separate channel dataset folder:
 
 ```text
 OUTPUT_DIR/
@@ -9,14 +9,28 @@ OUTPUT_DIR/
     ├── posts.csv
     ├── comments.jsonl
     ├── AGENTS.md              # generated, standalone dataset instructions
+    ├── .export.lock           # permanent lock file, not a busy marker
     └── media/                 # optional; only downloaded files
 ```
 
 `channel.csv`, `posts.csv`, and `comments.jsonl` belong together only when all
 records have the same `(export_id, export_revision)`. Never join mixed snapshots.
-Legacy records without `export_revision` are treated as revision 1. A non-empty
-folder is accepted only if its existing `channel.csv` identifies the same
-Telegram channel ID.
+Legacy records without `export_revision` are treated as revision 1. A base folder
+with contents other than `.export.lock` is recognized only if its existing `channel.csv` identifies the same
+Telegram channel ID; a foreign or unknown owner causes a refusal without writes.
+
+If the base name already exists, a new export uses
+`<name>__<YYYYMMDDTHHMMSSZ>_<random suffix>/`. The timestamp is the creation time
+in UTC, not the selected post period; that period is stored in `channel.csv`.
+Directory creation is exclusive, including when an earlier directory is still
+empty or contains only its persistent lock file. A fresh run never reuses an existing folder. Narrower periods, zero posts,
+failures and cancellations leave previous datasets unchanged. The original base
+path remains the first dataset, not an alias for the latest one. Callers must use
+the returned `folder`; the CLI prints it before collection and in its summary.
+
+Mode 2 / `resume_comments` is the explicit in-place update path for an existing
+verified dataset. Per-file atomic replacement still applies to publications
+within that dataset. New exports do not delete old datasets or share their media.
 
 ## Files and joins
 
@@ -77,18 +91,64 @@ This preserves the usable text snapshot, without claiming a directory-wide
 atomic transaction. Initial publication still uses the existing per-file atomic
 replacement and detection of mixed generations.
 
+## Interrupted post history
+
+Cmd+C / task cancellation or an ordinary history failure before the first normal
+publication stops all workers, then attempts to publish the posts already read.
+Completed media paths are retained; pending media and requested comment threads
+are marked interrupted. No new Telegram requests are started to save progress.
+The cancellation/error still propagates; saving a partial dataset does not turn
+the run into a successful export. Disk-full errors during that save stop a batch
+before another channel request, even when the original history error was not fatal.
+
+`channel.csv.posts_export_status` and the run-control record's matching field mean:
+
+- `complete`: post iteration reached its normal end or the lower date boundary;
+- `interrupted`: only the collected part of the requested history was saved.
+
+The selected `period_start` and `period_end` remain the requested period, not a
+claim of full coverage. A zero-row interrupted snapshot does not prove the period
+contains no posts. Legacy datasets without the field are treated as `complete`.
+Resuming comments preserves this status and only updates the saved subset of
+posts. It never fills missing history; use a new export for the complete period.
+
+Saving requires writable free disk space. Failures are reported with the folder
+path and do not replace older exports. A forced kill / power loss before the
+first publication cannot preserve in-memory progress; subsequent forced kills
+can lose unpublished comments. This is graceful interruption recovery, not
+periodic durable checkpointing.
+
+## Writer exclusion
+
+Fresh exports acquire `.export.lock` before metadata/history collection and hold
+the exclusive nonblocking OS lock through publication and cleanup. Resume takes
+the same lock before loading the local snapshot and holds it through validation,
+Telegram requests, updates, rollback and cancellation cleanup. The CLI also locks
+its preview read; resume rereads under its own lock after authentication.
+A busy folder produces an explicit refusal without snapshot reads or new
+Telegram requests by that resume. Different folders have independent locks.
+
+The open file descriptor owns the OS lock; closing it or ending the process
+releases it. The lock file is retained so competing writers cannot open different
+inodes after unlink/recreation. Its presence alone is not a busy signal. External
+scripts that bypass this locking protocol are not coordinated.
+The standard-library backends are [fcntl.flock](https://docs.python.org/3/library/fcntl.html#fcntl.flock)
+on Unix and [msvcrt.locking](https://docs.python.org/3/library/msvcrt.html#msvcrt.locking)
+on Windows. Native process tests were run on macOS; Windows was not tested here.
+
 ## Resuming comments
 
 Choose mode 2 at startup or use `--resume-comments <channel-folder>`. This mode
 reads a verified local snapshot, resolves its channel, and checks the channel ID
-before updating anything. Finish or interrupt the previous writer before using
-resume on the same folder. It never reads post history, refreshes channel metadata,
+before updating anything. Another active writer in the same folder causes a busy
+refusal. It never reads post history, refreshes channel metadata,
 reorders posts, or downloads media. Existing text, entities, media paths and media
 statuses remain available. Newly retrieved comments retain media metadata only.
 
 Saved comment records are copied lazily to the working spool. IDs are deduplicated
 within each source post, and exported counts are recalculated from those records.
-Complete threads with matching saved counts are skipped. Pending, interrupted,
+Complete threads whose saved unique records meet or exceed the advertised count
+are skipped. Pending, interrupted,
 failed, partial and previously unrequested threads with advertised replies are
 eligible for collection. A partial thread resumes with `offset_id` equal to its
 smallest saved comment ID: Telethon's default descending iterator fetches older
@@ -106,6 +166,8 @@ complete threads are not refreshed. Use a new export to obtain a current snapsho
 Resume starts from the last published records: Cmd+C publishes collected progress
 where possible; a forced kill can lose unpublished comments in the temporary spool.
 Mixed generations or corrupt files are refused without merging them.
+Changed local statuses, counts, deduplication or `comments_requested` are published
+even when no reply requests are needed. A true no-op leaves the saved files unchanged.
 
 ## Schemas
 
@@ -114,7 +176,7 @@ Mixed generations or corrupt files are refused without merging them.
 ```text
 export_id,export_revision,media_export_status,channel_id,title,username,description,subscriber_count,channel_type,
 broadcast,megagroup,gigagroup,verified,restricted,scam,fake,creation_time,
-linked_discussion_id,period_start,period_end,export_time
+linked_discussion_id,period_start,period_end,export_time,posts_export_status
 ```
 
 `posts.csv`, in order:
@@ -124,7 +186,7 @@ export_id,export_revision,channel_id,post_id,message_id,date,text,
 text_entities_json,grouped_id,media_order,views,forwards,reactions,
 link,comments_count,comments_exported,comments_available,
 comments_export_status,discussion_id,media_type,media_mime_type,media_size,
-media_name,media_local_path,media_status,media_extra_json
+media_name,media_local_path,media_status,media_extra_json,poll_text
 ```
 
 Comment records contain:
@@ -133,14 +195,14 @@ Comment records contain:
 record_type,export_id,export_revision,channel_id,source_post_id,discussion_chat_id,comment_id,
 discussion_thread_root_id,sender_id,sender_username,reply_to_comment_id,
 reply_to_top_id,text,text_entities_json,grouped_id,media_order,date,media_type,media_mime_type,media_size,media_name,
-media_local_path,media_status,media_extra_json
+media_local_path,media_status,media_extra_json,poll_text
 ```
 
 The run-control record contains:
 
 ```text
 record_type,export_id,export_revision,channel_id,period_start,period_end,comments_requested,
-export_time
+posts_export_status,export_time
 ```
 
 ## Interpret status fields correctly
@@ -154,7 +216,8 @@ before assuming that no records means no comments:
 - `disabled` — the post has no discussion replies;
 - `unavailable` — replies were advertised but the discussion is unavailable;
 - `pending` — thread collection has not finished in the first snapshot;
-- `complete` — the retrieved count matches Telegram's count;
+- `complete` — iteration finished normally and the retrieved count meets or
+  exceeds Telegram's initial count; new replies can make the exported count larger;
 - `partial` or `failed` — retain the records that exist, but do not treat them
   as a complete thread.
 - `interrupted` — collection stopped before any records were exported for the thread.
@@ -171,9 +234,45 @@ Media status values are `none`, `metadata_only`, `pending`, `skipped_by_filter`,
 `not_requested` for mode N. Filters never remove message rows or media metadata.
 Only `downloaded` supplies a local file path. Named files use the source record
 key and Telegram media ID; an unavailable media ID uses `export_id` instead.
-The same attachment can be reused on repeat runs, while replaced media gets a
-different path. Unreferenced older files are retained, but are not part of the
-current dataset.
+The same attachment has a deterministic relative name within its owning dataset,
+while replaced media gets a different name. A fresh export downloads independent
+files in its new folder; there is no cross-export reuse. Unreferenced older files
+are retained, but are not part of the current dataset.
+
+## Polls and non-file content
+
+`poll_text` is a readable question, numbered answers and available results in
+the same post/comment record. It is exported in every media mode, including N.
+Read `text` and `poll_text` as the content of one message. `text` remains the raw
+Telegram text against which `text_entities_json` offsets apply; `poll_text` is
+generated plain text. Legacy datasets without this field are read as an empty
+value. Resume preserves their saved text and does not refetch missing poll content.
+The CSV column is appended so existing column positions do not change.
+
+`media_type=poll` identifies the original type; it is not a photo/video selection.
+`media_extra_json.poll` retains the ID, question and `question_entities`, ordered
+`options` with `text`, `text_entities`, hex `data` from Telegram's `option` bytes,
+available `voters` and `correct`, `total_voters`, `results_min`, `closed`, `quiz`,
+`multiple_choice`, and any provided solution and its entities. Unknown results
+are null, not zero. The exporter never votes or fetches voter identities.
+
+Photo/document types are determined independently of attribute order: stickers
+and animations take precedence over generic images/video; `video_note` retains
+`round_message`. Only supported nonempty photo/document payloads are queued.
+Polls, contacts, link previews, dice, giveaways, stories and paid-media containers
+retain available metadata with `metadata_only`, empty `media_order` and no local
+file. Story/paid-media metadata does not promise nested-file download support.
+Unknown media and empty photo/document wrappers do not become failed downloads.
+
+Geo, GeoLive and Venue payloads are excluded: no coordinates, addresses or
+location details are exported. Their original message text and source type remain.
+Existing datasets are not scrubbed automatically; this applies to new records.
+
+For comments, `discussion_thread_root_id` is an ID in `discussion_chat_id`, not
+the source channel. It uses the thread's `reply_to_top_id`, or the root target
+of a direct reply when the top ID is absent. Missing headers leave it unknown.
+`reply_to_comment_id` and `reply_to_top_id` retain their original values, including
+references to the root message rather than a comment.
 
 ## Request pacing
 

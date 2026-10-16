@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
+from telethon.tl import types as tl_types
 from telethon.tl.types import (
     Channel,
     Chat,
@@ -144,8 +145,9 @@ def parse_media_info(msg) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
     media = msg.media
     media_dict: Dict[str, Any] = {"type": type(media).__name__}
 
-    if isinstance(media, MessageMediaPhoto) and media.photo:
+    if isinstance(media, MessageMediaPhoto) and isinstance(media.photo, tl_types.Photo):
         media_dict["type"] = "photo"
+        media_dict["mime_type"] = "image/jpeg"
         media_dict["id"] = media.photo.id
         sizes = getattr(media.photo, "sizes", [])
         if sizes:
@@ -155,7 +157,7 @@ def parse_media_info(msg) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
             media_dict["file_size"] = getattr(last_size, "size", None)
         return media_dict, media.photo
 
-    elif isinstance(media, MessageMediaDocument) and media.document:
+    elif isinstance(media, MessageMediaDocument) and isinstance(media.document, tl_types.Document):
         doc = media.document
         media_dict["type"] = "document"
         media_dict["id"] = doc.id
@@ -166,24 +168,32 @@ def parse_media_info(msg) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
             if isinstance(attr, DocumentAttributeFilename):
                 media_dict["file_name"] = attr.file_name
             elif isinstance(attr, DocumentAttributeImageSize):
-                media_dict["type"] = "image"
                 media_dict["width"] = attr.w
                 media_dict["height"] = attr.h
             elif isinstance(attr, DocumentAttributeVideo):
-                media_dict["type"] = "video"
                 media_dict["duration"] = attr.duration
                 media_dict["width"] = attr.w
                 media_dict["height"] = attr.h
                 media_dict["supports_streaming"] = getattr(attr, "supports_streaming", False)
+                media_dict["round_message"] = bool(attr.round_message)
             elif isinstance(attr, DocumentAttributeAudio):
-                media_dict["type"] = "voice" if getattr(attr, "voice", False) else "audio"
                 media_dict["duration"] = attr.duration
                 media_dict["title"] = getattr(attr, "title", None)
                 media_dict["performer"] = getattr(attr, "performer", None)
-            elif type(attr).__name__ == "DocumentAttributeSticker":
-                media_dict["type"] = "sticker"
+            elif isinstance(attr, tl_types.DocumentAttributeSticker):
                 media_dict["sticker_emoji"] = getattr(attr, "alt", None)
 
+        attributes = {type(attr): attr for attr in doc.attributes}
+        if tl_types.DocumentAttributeSticker in attributes:
+            media_dict["type"] = "sticker"
+        elif tl_types.DocumentAttributeAnimated in attributes or doc.mime_type == "image/gif":
+            media_dict["type"] = "animation"
+        elif DocumentAttributeVideo in attributes:
+            media_dict["type"] = "video_note" if media_dict["round_message"] else "video"
+        elif DocumentAttributeAudio in attributes:
+            media_dict["type"] = "voice" if attributes[DocumentAttributeAudio].voice else "audio"
+        elif DocumentAttributeImageSize in attributes or doc.mime_type.startswith("image/"):
+            media_dict["type"] = "image"
         return media_dict, doc
 
     elif isinstance(media, MessageMediaPoll) and media.poll:
@@ -191,26 +201,76 @@ def parse_media_info(msg) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
         poll_info = {
             "id": poll.id,
             "question": poll.question.text if hasattr(poll.question, "text") else str(poll.question),
-            "closed": poll.closed,
+            "question_entities": [entity.to_dict() for entity in getattr(poll.question, "entities", [])],
+            "closed": bool(poll.closed),
+            "quiz": bool(poll.quiz),
+            "multiple_choice": bool(poll.multiple_choice),
             "options": [
                 {
                     "text": opt.text.text if hasattr(opt.text, "text") else str(opt.text),
-                    "data": opt.data.hex(),
+                    "data": opt.option.hex(),
+                    "text_entities": [entity.to_dict() for entity in getattr(opt.text, "entities", [])],
                 }
                 for opt in poll.answers
             ],
         }
-        if media.results and hasattr(media.results, "total_voters"):
-            poll_info["total_voters"] = media.results.total_voters
+        results = media.results
+        votes = {item.option.hex(): item for item in (getattr(results, "results", None) or [])}
+        poll_info["total_voters"] = getattr(results, "total_voters", None)
+        poll_info["results_min"] = bool(results.min) if results is not None else None
+        lines = [poll_info["question"]]
+        for index, option in enumerate(poll_info["options"], 1):
+            result = votes.get(option["data"])
+            option["voters"] = getattr(result, "voters", None)
+            option["correct"] = getattr(result, "correct", None)
+            line = f'{index}. {option["text"]}'
+            if option["voters"] is not None:
+                line += f' (голоса: {option["voters"]})'
+            if option["correct"]:
+                line += ' [правильный ответ]'
+            lines.append(line)
+        if poll_info["total_voters"] is not None:
+            lines.append(f'Всего проголосовало: {poll_info["total_voters"]}')
+        for flag, label in (("quiz", "Викторина"), ("multiple_choice", "Можно выбрать несколько вариантов"), ("closed", "Опрос закрыт")):
+            if poll_info[flag]:
+                lines.append(label)
+        if getattr(results, "solution", None) is not None:
+            poll_info["solution"] = results.solution
+            poll_info["solution_entities"] = [entity.to_dict() for entity in (results.solution_entities or [])]
+            lines.append(f'Пояснение: {results.solution}')
         media_dict["type"] = "poll"
         media_dict["poll"] = poll_info
+        media_dict["poll_text"] = '\n'.join(lines)
         return media_dict, None
 
-    elif isinstance(media, MessageMediaGeo):
-        geo = media.geo
+    elif isinstance(media, (MessageMediaGeo, tl_types.MessageMediaGeoLive, tl_types.MessageMediaVenue)):
         media_dict["type"] = "location"
-        media_dict["latitude"] = getattr(geo, "lat", None)
-        media_dict["longitude"] = getattr(geo, "long", None)
+        return media_dict, None
+
+    elif isinstance(media, tl_types.MessageMediaDice):
+        media_dict.update(type="dice", value=media.value, emoticon=media.emoticon)
+        return media_dict, None
+
+    elif isinstance(media, (tl_types.MessageMediaGiveaway, tl_types.MessageMediaGiveawayResults)):
+        media_dict["type"] = "giveaway_results" if isinstance(media, tl_types.MessageMediaGiveawayResults) else "giveaway"
+        for field in ("channels", "quantity", "countries_iso2", "prize_description", "months", "stars",
+                      "only_new_subscribers", "winners_are_visible", "winners_count", "unclaimed_count",
+                      "winners", "channel_id", "launch_msg_id", "additional_peers_count", "refunded"):
+            value = getattr(media, field, None)
+            if value is not None:
+                media_dict[field] = value
+        media_dict["until_date"] = isoformat_utc(media.until_date)
+        return media_dict, None
+
+    elif isinstance(media, tl_types.MessageMediaStory):
+        media_dict.update(type="story", story_id=media.id, peer=media.peer.to_dict())
+        if getattr(media.story, "caption", None) is not None:
+            media_dict["caption"] = media.story.caption
+        return media_dict, None
+
+    elif isinstance(media, tl_types.MessageMediaPaidMedia):
+        media_dict.update(type="paid_media", stars_amount=media.stars_amount,
+                          attachment_count=len(media.extended_media))
         return media_dict, None
 
     elif isinstance(media, MessageMediaContact):
@@ -221,7 +281,7 @@ def parse_media_info(msg) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
         media_dict["user_id"] = media.user_id
         return media_dict, None
 
-    elif isinstance(media, MessageMediaWebPage) and media.webpage:
+    elif isinstance(media, MessageMediaWebPage):
         web = media.webpage
         media_dict["type"] = "web_page"
         media_dict["url"] = getattr(web, "url", None)
@@ -229,7 +289,7 @@ def parse_media_info(msg) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
         media_dict["description"] = getattr(web, "description", None)
         return media_dict, None
 
-    return media_dict, media
+    return media_dict, None
 
 
 async def serialize_message(
